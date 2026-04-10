@@ -82,6 +82,7 @@
     let depositing = false;
     let lastHandledRequestId = null;
     let flowState = 'idle';
+    let lastStockMaxAt = 0;
 
     function safeJsonParse(value, fallback = null) {
         try {
@@ -662,19 +663,30 @@
     }
 
     function getStockBuyBtn() {
-        const candidates = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
-        return candidates.find(el => /^buy$/i.test((el.textContent || el.value || '').trim())) || null;
+        const scope = document.querySelector('#panel-ownedTab') || document;
+        const candidates = Array.from(scope.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
+        return candidates.find(el => /\bbuy\b/i.test((el.textContent || el.value || '').trim())) || null;
     }
 
     function getStockAmountInput() {
         const panel = document.querySelector('#panel-ownedTab') || document;
-        return panel.querySelector('input[name*="amount"], input[name*="share"], input[type="number"], input[type="text"]');
+        const inputs = Array.from(panel.querySelectorAll('input[name*="amount"], input[name*="share"], input[type="number"], input[type="text"]'));
+        return inputs.find((input) => {
+            const name = (input.name || '').toLowerCase();
+            const placeholder = (input.placeholder || '').toLowerCase();
+            if (input.type === 'hidden') return false;
+            if (input.type === 'search') return false;
+            if (name.includes('search')) return false;
+            if (placeholder.includes('search')) return false;
+            return true;
+        }) || null;
     }
 
     async function clickStockMax() {
         const btn = getStockMaxBtn();
         if (!btn) return false;
         tap(btn);
+        lastStockMaxAt = Date.now();
         await sleep(120);
         return true;
     }
@@ -685,7 +697,8 @@
 
         const amountInput = getStockAmountInput();
         const amountValue = amountInput ? parseMoneyText(amountInput.value) : null;
-        if (!Number.isFinite(amountValue) || amountValue <= 0) return false;
+        const maxRecentlyApplied = (Date.now() - lastStockMaxAt) <= 7000;
+        if (!maxRecentlyApplied && (!Number.isFinite(amountValue) || amountValue <= 0)) return false;
 
         const buyBtn = getStockBuyBtn();
         if (!buyBtn) return false;
@@ -701,7 +714,7 @@
     function getConfirmBtn(modal = null) {
         const scope = modal || document;
         const candidates = Array.from(scope.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
-        return candidates.find(el => /^(confirm|buy)$/i.test((el.textContent || el.value || '').trim())) || null;
+        return candidates.find(el => /\b(confirm|buy|yes)\b/i.test((el.textContent || el.value || '').trim())) || null;
     }
 
     function guardBeforeConfirm(stockSymbol) {
@@ -777,7 +790,7 @@
         try {
             lastHandledRequestId = request.requestId;
 
-            if (!isVaultPage() && !request.forceOverflow) {
+            if (!isVaultPage() && !request.forceOverflow && !isStocksPage()) {
                 setFlowState('vault_nav');
                 goToVaultPage();
                 return;
@@ -799,6 +812,9 @@
             }
 
             if (decision.route === 'stock') {
+                if (!request.forceOverflow) {
+                    setDepositRequest({ ...request, forceOverflow: true });
+                }
                 const stockSymbol = getSettings().overflowStockSymbol;
                 const stockSuccess = await doStockOverflowBuy(stockSymbol);
                 if (stockSuccess) {
