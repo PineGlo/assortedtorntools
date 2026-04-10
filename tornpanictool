@@ -20,6 +20,7 @@
         cashMode: 'pineglow_cash_mode',
         pauseMode: 'pineglow_pause_mode',
         leaderMode: 'pineglow_leader_mode',
+        leaderLockedTab: 'pineglow_leader_locked_tab_v1',
         lastAuto: 'pineglow_last_auto',
         leaderState: 'pineglow_simple_leader_state_v2',
         leaderDepositRequest: 'pineglow_leader_deposit_request_v2'
@@ -74,6 +75,7 @@
     let uiCashEl = null;
     let uiSettingsBody = null;
     let uiFlowEl = null;
+    let uiLeaderCheckbox = null;
 
     let settingsInputs = {};
     let depositing = false;
@@ -178,6 +180,21 @@
 
     function isLeaderModeEnabled() {
         return localStorage.getItem(KEYS.leaderMode) !== '0';
+    }
+
+    function getLockedLeaderTabId() {
+        return localStorage.getItem(KEYS.leaderLockedTab) || '';
+    }
+
+    function isThisTabLockedLeader() {
+        return getLockedLeaderTabId() === TAB_ID;
+    }
+
+    function canThisTabRunLeaderFlow() {
+        if (!isLeaderModeEnabled()) return false;
+        const lockedTabId = getLockedLeaderTabId();
+        if (lockedTabId && lockedTabId !== TAB_ID) return false;
+        return true;
     }
 
     function isPaused() {
@@ -368,7 +385,7 @@
     }
 
     function shouldTakeLeadership(currentLeader) {
-        if (!isLeaderModeEnabled()) return false;
+        if (!canThisTabRunLeaderFlow()) return false;
 
         const mine = getMyLeaderPayload();
 
@@ -382,13 +399,13 @@
     }
 
     function maybeClaimLeadership(force = false) {
-        if (!force && !isLeaderModeEnabled()) {
+        if (!force && !canThisTabRunLeaderFlow()) {
             updateUIStatus();
             return false;
         }
 
         const currentLeader = readLeaderState();
-        if (force || shouldTakeLeadership(currentLeader)) {
+        if ((force && canThisTabRunLeaderFlow()) || shouldTakeLeadership(currentLeader)) {
             writeLeaderState(getMyLeaderPayload());
             updateUIStatus();
             return true;
@@ -398,7 +415,7 @@
     }
 
     function heartbeatLeadership() {
-        if (!isLeaderModeEnabled()) {
+        if (!canThisTabRunLeaderFlow()) {
             releaseLeadershipIfOwned();
             updateUIStatus();
             return;
@@ -628,7 +645,7 @@
             const leader = readLeaderState();
             const mine = getMyLeaderPayload();
             const iAmLeader = amLeader();
-            const leaderEnabled = isLeaderModeEnabled();
+            const leaderEnabled = canThisTabRunLeaderFlow();
 
             const role = mine.isVault ? 'Vault Tab' : (mine.isVisible ? 'Active Tab' : 'Background Tab');
 
@@ -1057,17 +1074,18 @@
         });
 
         leaderCheckbox.type = 'checkbox';
-        leaderCheckbox.checked = isLeaderModeEnabled();
+        leaderCheckbox.checked = isThisTabLockedLeader();
         leaderCheckbox.style.cursor = 'pointer';
-        leaderText.textContent = 'Leader Enabled';
+        leaderText.textContent = 'Only This Tab';
+        uiLeaderCheckbox = leaderCheckbox;
 
         leaderCheckbox.onchange = () => {
-            const enabled = leaderCheckbox.checked;
-            localStorage.setItem(KEYS.leaderMode, enabled ? '1' : '0');
-
-            if (!enabled) {
-                releaseLeadershipIfOwned();
-            } else {
+            if (leaderCheckbox.checked) {
+                localStorage.setItem(KEYS.leaderMode, '1');
+                localStorage.setItem(KEYS.leaderLockedTab, TAB_ID);
+                maybeClaimLeadership(true);
+            } else if (isThisTabLockedLeader()) {
+                localStorage.removeItem(KEYS.leaderLockedTab);
                 maybeClaimLeadership(true);
             }
 
@@ -1353,10 +1371,19 @@
             if (
                 e.key === KEYS.leaderState ||
                 e.key === KEYS.leaderDepositRequest ||
+                e.key === KEYS.leaderLockedTab ||
                 e.key === KEYS.cashMode ||
                 e.key === KEYS.autoMode ||
                 Object.values(SETTINGS_KEYS).includes(e.key)
             ) {
+                if (e.key === KEYS.leaderLockedTab && !canThisTabRunLeaderFlow()) {
+                    releaseLeadershipIfOwned();
+                }
+
+                if (uiLeaderCheckbox) {
+                    uiLeaderCheckbox.checked = isThisTabLockedLeader();
+                }
+
                 updateUIStatus();
 
                 if (e.key === KEYS.leaderDepositRequest && amLeader()) {
