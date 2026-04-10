@@ -18,6 +18,7 @@
     const KEYS = {
         autoMode: 'pineglow_auto_mode',
         cashMode: 'pineglow_cash_mode',
+        leaderMode: 'pineglow_leader_mode',
         lastAuto: 'pineglow_last_auto',
         leaderState: 'pineglow_simple_leader_state_v2',
         leaderDepositRequest: 'pineglow_leader_deposit_request_v2'
@@ -172,6 +173,10 @@
 
     function isAutoModeEnabled() {
         return localStorage.getItem(KEYS.autoMode) === '1';
+    }
+
+    function isLeaderModeEnabled() {
+        return localStorage.getItem(KEYS.leaderMode) !== '0';
     }
 
     function isVaultPage() {
@@ -358,6 +363,8 @@
     }
 
     function shouldTakeLeadership(currentLeader) {
+        if (!isLeaderModeEnabled()) return false;
+
         const mine = getMyLeaderPayload();
 
         if (!currentLeader) return true;
@@ -370,6 +377,11 @@
     }
 
     function maybeClaimLeadership(force = false) {
+        if (!force && !isLeaderModeEnabled()) {
+            updateUIStatus();
+            return false;
+        }
+
         const currentLeader = readLeaderState();
         if (force || shouldTakeLeadership(currentLeader)) {
             writeLeaderState(getMyLeaderPayload());
@@ -381,6 +393,12 @@
     }
 
     function heartbeatLeadership() {
+        if (!isLeaderModeEnabled()) {
+            releaseLeadershipIfOwned();
+            updateUIStatus();
+            return;
+        }
+
         if (amLeader()) {
             writeLeaderState(getMyLeaderPayload());
         } else {
@@ -568,16 +586,21 @@
             const leader = readLeaderState();
             const mine = getMyLeaderPayload();
             const iAmLeader = amLeader();
+            const leaderEnabled = isLeaderModeEnabled();
 
             const role = mine.isVault ? 'Vault Tab' : (mine.isVisible ? 'Active Tab' : 'Background Tab');
 
-            uiStatusEl.textContent = iAmLeader
-                ? `Leader: YES | ${role}`
-                : `Leader: NO | ${role}`;
+            if (!leaderEnabled) {
+                uiStatusEl.textContent = `Leader: OFF | ${role}`;
+                uiStatusEl.style.color = '#AAA';
+            } else {
+                uiStatusEl.textContent = iAmLeader
+                    ? `Leader: YES | ${role}`
+                    : `Leader: NO | ${role}`;
+                uiStatusEl.style.color = iAmLeader ? '#7CFF9E' : '#FFC66D';
+            }
 
-            uiStatusEl.style.color = iAmLeader ? '#7CFF9E' : '#FFC66D';
-
-            if (leader && !iAmLeader) {
+            if (leader && !iAmLeader && leaderEnabled) {
                 const leaderLabel = leader.isVault ? 'Vault Tab' : (leader.isVisible ? 'Active Tab' : 'Background Tab');
                 uiStatusEl.title = `Current leader: ${leaderLabel}`;
             } else {
@@ -847,6 +870,10 @@
             localStorage.setItem(KEYS.autoMode, '0');
         }
 
+        if (localStorage.getItem(KEYS.leaderMode) === null) {
+            localStorage.setItem(KEYS.leaderMode, '1');
+        }
+
         const panel = document.createElement('div');
         panel.id = 'panic-panel';
 
@@ -929,6 +956,9 @@
         const cashToggle = document.createElement('button');
         const testBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
+        const leaderWrap = document.createElement('label');
+        const leaderCheckbox = document.createElement('input');
+        const leaderText = document.createElement('span');
 
         [autoToggle, cashToggle, testBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
@@ -958,6 +988,38 @@
             settingsToggle.textContent = collapsed ? 'Settings +' : 'Settings −';
             settingsToggle.style.background = '#2a2a2a';
         }
+
+        Object.assign(leaderWrap.style, {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            color: '#ddd',
+            fontSize: '12px',
+            fontWeight: '700',
+            padding: '2px 2px 0 2px',
+            cursor: 'pointer'
+        });
+
+        leaderCheckbox.type = 'checkbox';
+        leaderCheckbox.checked = isLeaderModeEnabled();
+        leaderCheckbox.style.cursor = 'pointer';
+        leaderText.textContent = 'Leader Enabled';
+
+        leaderCheckbox.onchange = () => {
+            const enabled = leaderCheckbox.checked;
+            localStorage.setItem(KEYS.leaderMode, enabled ? '1' : '0');
+
+            if (!enabled) {
+                releaseLeadershipIfOwned();
+            } else {
+                maybeClaimLeadership(true);
+            }
+
+            updateUIStatus();
+        };
+
+        leaderWrap.appendChild(leaderCheckbox);
+        leaderWrap.appendChild(leaderText);
 
         autoToggle.onclick = () => {
             const enabled = isAutoModeEnabled();
@@ -1089,6 +1151,7 @@
         body.appendChild(autoToggle);
         body.appendChild(cashToggle);
         body.appendChild(testBtn);
+        body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
         body.appendChild(uiCashEl);
         body.appendChild(uiFlowEl);
