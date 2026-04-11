@@ -60,7 +60,16 @@
         pauseHotkey: ''
     };
 
-    const TAB_ID = `vaultpanic_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    function getOrCreateTabId() {
+        const sessionKey = 'pineglow_vaultpanic_tab_id_v1';
+        const existing = sessionStorage.getItem(sessionKey);
+        if (existing) return existing;
+        const created = `vaultpanic_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        sessionStorage.setItem(sessionKey, created);
+        return created;
+    }
+
+    const TAB_ID = getOrCreateTabId();
     const bc = typeof BroadcastChannel !== 'undefined'
         ? new BroadcastChannel('pineglow_vaultpanic_leader_v2')
         : null;
