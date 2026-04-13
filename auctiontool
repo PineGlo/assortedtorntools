@@ -329,15 +329,15 @@
     }
 
     function calcBunkerBucks(itemName, rarityKey, bonusCount, itemType = 'weapon') {
-        if (!rarityKey) return null;
         const category = itemType === 'armor' ? 'Armor' : WEAPON_TYPE_BY_NAME[normalizeItemName(itemName)];
         if (!category) return null;
         const row = BB_VALUE_TABLE[category];
         if (!row) return null;
+        if (!rarityKey) return 0;
         if (rarityKey === 'yellow') return row.yellow;
         if (rarityKey === 'orange') return bonusCount >= 2 && row.orangeTwo != null ? row.orangeTwo : row.orange;
         if (rarityKey === 'red') return bonusCount >= 2 && row.redTwo != null ? row.redTwo : row.red;
-        return null;
+        return 0;
     }
 
     function bbDisplayText(bbAmount) {
@@ -372,15 +372,16 @@
 
     function injectCollapsedBBInfo(btn, bbAmount) {
         btn.querySelector('.ah-bb-inline')?.remove();
-        if (bbAmount == null) return;
-
         const attachments = btn.querySelectorAll('.bonus-attachment');
+        if (!attachments.length && bbAmount == null) {
+            return;
+        }
         if (!attachments.length) {
             injectBBBage(btn, bbAmount);
             return;
         }
 
-        const info = bbDisplayText(bbAmount);
+        const info = bbAmount == null ? { text: 'BB N/A', title: 'Unable to determine BB for this item.' } : bbDisplayText(bbAmount);
         const wrap = document.createElement('span');
         wrap.className = 'bonus-attachment ah-bb-inline';
         wrap.innerHTML = `<i class="bonus-attachment-item-bb-bonus"></i><span class="label-value t-overflow">${info.text}</span>`;
@@ -407,7 +408,7 @@
     }
 
     function injectCollapsedAuctionButtons() {
-        document.querySelectorAll('button.view-info.wai-btn').forEach(btn => {
+        document.querySelectorAll('button.view-info').forEach(btn => {
             const aria = btn.getAttribute('aria-label') || '';
             if (!aria) return;
 
