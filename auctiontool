@@ -333,11 +333,11 @@
         if (!category) return null;
         const row = BB_VALUE_TABLE[category];
         if (!row) return null;
-        if (!rarityKey) return 0;
+        if (!rarityKey) return null;
         if (rarityKey === 'yellow') return row.yellow;
         if (rarityKey === 'orange') return bonusCount >= 2 && row.orangeTwo != null ? row.orangeTwo : row.orange;
         if (rarityKey === 'red') return bonusCount >= 2 && row.redTwo != null ? row.redTwo : row.red;
-        return 0;
+        return null;
     }
 
     function bbDisplayText(bbAmount) {
@@ -372,16 +372,22 @@
 
     function injectCollapsedBBInfo(btn, bbAmount) {
         btn.querySelector('.ah-bb-inline')?.remove();
+        btn.querySelector('.ah-bb-always')?.remove();
+        if (bbAmount == null) return;
+
+        const info = bbDisplayText(bbAmount);
+        if (getComputedStyle(btn).position === 'static') btn.style.position = 'relative';
+        const always = document.createElement('span');
+        always.className = 'bonus-attachment ah-bb-inline ah-bb-always';
+        always.innerHTML = `<i class="bonus-attachment-item-bb-bonus"></i><span class="label-value t-overflow">${info.text}</span>`;
+        if (info.title) always.title = info.title;
+        btn.appendChild(always);
+
         const attachments = btn.querySelectorAll('.bonus-attachment');
-        if (!attachments.length && bbAmount == null) {
-            return;
-        }
         if (!attachments.length) {
             injectBBBage(btn, bbAmount);
             return;
         }
-
-        const info = bbAmount == null ? { text: 'BB N/A', title: 'Unable to determine BB for this item.' } : bbDisplayText(bbAmount);
         const wrap = document.createElement('span');
         wrap.className = 'bonus-attachment ah-bb-inline';
         wrap.innerHTML = `<i class="bonus-attachment-item-bb-bonus"></i><span class="label-value t-overflow">${info.text}</span>`;
@@ -393,7 +399,7 @@
         const t = (aria || '').toLowerCase();
         if (t.includes('extremely rare') || t.includes('very rare')) return 'red';
         if (t.includes('extraordinary') || /\brare\b/.test(t)) return 'orange';
-        if (t.includes('uncommon') || t.includes('yellow')) return 'yellow';
+        if (t.includes('uncommon') || t.includes('yellow') || t.includes('common')) return 'yellow';
         return null;
     }
 
@@ -956,6 +962,16 @@ function parseCurrentListingPrice() {
         .ah-bb-inline .label-value {
             color: #ffd666 !important;
             font-weight: 700;
+        }
+        .ah-bb-always {
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            z-index: 6;
+            background: rgba(0,0,0,0.65);
+            border-radius: 3px;
+            padding: 1px 4px;
+            max-width: calc(100% - 6px);
         }
         .bonus-attachment-item-bb-bonus::before {
             content: "BB";
