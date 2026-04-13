@@ -89,6 +89,7 @@
     let uiFlowEl = null;
     let uiLeaderCheckbox = null;
     let uiPauseToggleBtn = null;
+    let uiPanelEl = null;
 
     let settingsInputs = {};
     let depositing = false;
@@ -816,6 +817,22 @@
         const paused = isPaused();
         uiPauseToggleBtn.textContent = `Paused: ${paused ? 'ON' : 'OFF'}`;
         uiPauseToggleBtn.style.background = paused ? '#5C1F2A' : '#2a2a2a';
+        refreshPanelPausedAppearance();
+    }
+
+    function refreshPanelPausedAppearance() {
+        if (!uiPanelEl) return;
+        const paused = isPaused();
+        const collapsed = localStorage.getItem(UI_KEYS.collapsed) === '1';
+
+        if (paused && collapsed) {
+            uiPanelEl.style.background = 'rgba(92,31,42,0.95)';
+            uiPanelEl.style.border = '1px solid rgba(255,142,161,0.75)';
+            return;
+        }
+
+        uiPanelEl.style.background = 'rgba(10,10,10,0.92)';
+        uiPanelEl.style.border = '1px solid rgba(255,255,255,0.15)';
     }
 
     function setPausedState(paused) {
@@ -1136,6 +1153,7 @@
 
         const panel = document.createElement('div');
         panel.id = 'panic-panel';
+        uiPanelEl = panel;
 
         Object.assign(panel.style, {
             position: 'fixed',
@@ -1454,6 +1472,7 @@
             collapseBtn.textContent = collapsed ? '+' : '−';
             panel.style.minWidth = collapsed ? '100px' : '240px';
             localStorage.setItem(UI_KEYS.collapsed, collapsed ? '1' : '0');
+            refreshPanelPausedAppearance();
         }
 
         collapseBtn.onclick = (e) => {
