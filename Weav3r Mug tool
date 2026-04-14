@@ -42,6 +42,8 @@
     coreClient: null,
     coreMode: "offline", // direct | bridge | offline
     bridgeSnapshotTs: 0,
+    domBridgeSnapshot: null,
+    domBridgeTimer: null,
     lastPlan: { needTorn: 0, needFF: 0 },
     observer: null,
     scanTimer: null,
@@ -681,6 +683,16 @@
       };
     }
 
+    if (state.domBridgeSnapshot?.users?.byId) {
+      return {
+        mode: "bridge_dom",
+        getUser: (userId) => state.domBridgeSnapshot?.users?.byId?.[String(userId)] || null,
+        subscribe: () => (() => {}),
+        requestUsersFFRefresh: (userIds) => requestDomBridge("user.refresh.ff.batch", { userIds }),
+        requestUsersTornRefresh: (userIds, opts = {}) => requestDomBridge("user.refresh.torn.batch", { userIds, ...opts }),
+      };
+    }
+
     const bridgeSnapshotKey = "torn_core_v2_bridge_snapshot";
     const bridgeRequestKey = "torn_core_v2_bridge_requests";
     const bridgeResponseKey = "torn_core_v2_bridge_responses";
@@ -741,6 +753,26 @@
           resolve({ ok: false, timeout: true, error: "Bridge request timeout." });
         }
       }, 300);
+    });
+  }
+
+  function requestDomBridge(type, payload = {}) {
+    const id = `wmh_dom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise((resolve) => {
+      const onResponse = (event) => {
+        const detail = event?.detail || {};
+        if (detail.id !== id) return;
+        window.removeEventListener("torn-core-bridge-response", onResponse);
+        resolve(detail.result || { ok: false, error: "Empty DOM bridge response." });
+      };
+      window.addEventListener("torn-core-bridge-response", onResponse);
+      window.dispatchEvent(new CustomEvent("torn-core-bridge-request", {
+        detail: { id, type, payload },
+      }));
+      setTimeout(() => {
+        window.removeEventListener("torn-core-bridge-response", onResponse);
+        resolve({ ok: false, timeout: true, error: "DOM bridge timeout." });
+      }, 2500);
     });
   }
 
@@ -1008,6 +1040,20 @@
       for (const userId of state.sellers.keys()) renderSeller(userId);
       updateStatusLine();
     });
+
+    if (state.domBridgeTimer) clearInterval(state.domBridgeTimer);
+    state.domBridgeTimer = setInterval(() => {
+      requestDomBridge("core.getSnapshot")
+        .then((result) => {
+          if (!result?.ok || !result?.data) return;
+          state.domBridgeSnapshot = result.data;
+          state.coreClient = createCoreClient();
+          state.coreMode = state.coreClient.mode;
+          for (const userId of state.sellers.keys()) renderSeller(userId);
+          updateStatusLine();
+        })
+        .catch(() => {});
+    }, 1500);
   }
 
   function init() {

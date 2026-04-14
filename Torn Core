@@ -2054,6 +2054,35 @@
     function initBridgeClientMode() {
         const snap = GM_getValue(BRIDGE_KEYS.snapshot, null);
         exposeBridgeWindowApi(snap);
+        setupBridgeDomEvents();
+    }
+
+    function setupBridgeDomEvents() {
+        window.addEventListener('torn-core-bridge-request', (event) => {
+            const detail = event?.detail || {};
+            const requestId = detail?.id;
+            const type = String(detail?.type || '');
+            const payload = detail?.payload || {};
+            if (!requestId || !type) return;
+
+            const respond = (result) => {
+                window.dispatchEvent(new CustomEvent('torn-core-bridge-response', {
+                    detail: { id: requestId, result }
+                }));
+            };
+
+            if (type === 'core.getSnapshot') {
+                respond({
+                    ok: true,
+                    data: GM_getValue(BRIDGE_KEYS.snapshot, null) || null,
+                });
+                return;
+            }
+
+            requestBridgeBroker(type, payload)
+                .then((result) => respond(result))
+                .catch((err) => respond({ ok: false, error: String(err?.message || err || 'Bridge DOM request failed') }));
+        });
     }
 
     function init() {
