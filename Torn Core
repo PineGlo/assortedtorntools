@@ -74,6 +74,8 @@
             leader: null,
             ui: null,
         },
+        brokerSeq: 0,
+        brokerPending: {},
 
         panel: null,
         panelBody: null,
@@ -302,6 +304,12 @@
         return fallback ? normalizeText(fallback[0]) : '';
     }
 
+    function toEpochMs(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        return n < 1e12 ? n * 1000 : n;
+    }
+
     function fmtMoney(v) {
         return Number.isFinite(v) ? `$${Math.round(v).toLocaleString()}` : '-';
     }
@@ -383,8 +391,12 @@
             }
 
             if (msg.type === 'request-broker' && state.isLeader) {
-                // scaffold hook
                 handleBrokerMessage(msg);
+                return;
+            }
+
+            if (msg.type === 'broker-response') {
+                handleBrokerResponse(msg);
                 return;
             }
         };
@@ -471,8 +483,9 @@
     }
 
     function requestBroker(type, payload = {}) {
+        const requestId = `req_${Date.now()}_${++state.brokerSeq}_${Math.random().toString(36).slice(2, 8)}`;
         const req = {
-            id: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            id: requestId,
             type,
             payload,
             requesterTabId: state.tabId,
@@ -488,18 +501,57 @@
             request: req,
         });
 
-        return Promise.resolve({
-            ok: false,
-            brokered: true,
-            message: 'Broker request queued to leader. Async response wiring not yet implemented in scaffold.',
-            request: req,
+        return new Promise((resolve) => {
+            const timeoutMs = 7000;
+            const timeout = setTimeout(() => {
+                delete state.brokerPending[requestId];
+                resolve({
+                    ok: false,
+                    brokered: true,
+                    timeout: true,
+                    message: 'Broker response timed out waiting for leader.',
+                    request: req,
+                });
+            }, timeoutMs);
+
+            state.brokerPending[requestId] = { resolve, timeout };
         });
     }
 
     function handleBrokerMessage(msg) {
         const req = msg.request;
         if (!req) return;
-        handleBrokerRequest(req);
+        Promise.resolve(handleBrokerRequest(req))
+            .then((result) => {
+                if (!req.requesterTabId || req.requesterTabId === state.tabId) return;
+                broadcast({
+                    type: 'broker-response',
+                    requestId: req.id,
+                    requesterTabId: req.requesterTabId,
+                    result,
+                });
+            })
+            .catch((err) => {
+                if (!req.requesterTabId || req.requesterTabId === state.tabId) return;
+                broadcast({
+                    type: 'broker-response',
+                    requestId: req.id,
+                    requesterTabId: req.requesterTabId,
+                    result: {
+                        ok: false,
+                        error: String(err?.message || err || 'Broker execution failed'),
+                    }
+                });
+            });
+    }
+
+    function handleBrokerResponse(msg) {
+        if (!msg || msg.requesterTabId !== state.tabId) return;
+        const pending = state.brokerPending[msg.requestId];
+        if (!pending) return;
+        clearTimeout(pending.timeout);
+        delete state.brokerPending[msg.requestId];
+        pending.resolve(msg.result || { ok: false, error: 'Empty broker response' });
     }
 
     function makeCacheKey(type, payload) {
@@ -558,6 +610,56 @@
         } finally {
             try { db?.close(); } catch (_) {}
         }
+    }
+
+    function requestTornProfileApi(userId, forceFresh = false) {
+        return new Promise((resolve) => {
+            const key = String(state.cfg.tornApiKey || '').trim();
+            if (!key) {
+                resolve({ ok: false, userId, error: 'Missing Torn API key in Torn Core settings.' });
+                return;
+            }
+
+            let url = `https://api.torn.com/user/${Number(userId)}?selections=profile&key=${encodeURIComponent(key)}&comment=torn_core_batch`;
+            if (forceFresh) {
+                url += `&timestamp=${Date.now()}`;
+            }
+
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                onload: (response) => {
+                    try {
+                        const data = JSON.parse(response.responseText || '{}');
+                        if (data.error) {
+                            resolve({
+                                ok: false,
+                                userId,
+                                error: data.error.error || 'API error',
+                                errorCode: Number(data.error.code) || null,
+                            });
+                            return;
+                        }
+
+                        const status = data.status || {};
+                        const statusText = normalizeStatusText(status.state || status.description || '');
+                        const hospitalUntil = toEpochMs(status.until);
+                        resolve({
+                            ok: true,
+                            userId,
+                            status: statusText,
+                            hospitalUntil,
+                            hospitalEtaText: '',
+                            fetchedAt: now(),
+                        });
+                    } catch (err) {
+                        resolve({ ok: false, userId, error: 'Parse error' });
+                    }
+                },
+                onerror: () => resolve({ ok: false, userId, error: 'Network error' }),
+                ontimeout: () => resolve({ ok: false, userId, error: 'Timeout' }),
+            });
+        });
     }
 
     function handleBrokerRequest(req) {
@@ -688,6 +790,14 @@
 
     function brokerTornBatch(userIds, cacheKey, payload = {}) {
         const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
+        if (!uniqueIds.length) {
+            return Promise.resolve({
+                ok: true,
+                source: 'policy',
+                data: { userIds: [], results: {}, usedApi: false }
+            });
+        }
+
         if (uniqueIds.length === 1 && !payload.forceSingleApi) {
             const singleUserId = uniqueIds[0];
             const cachedUser = state.core.users.byId[String(singleUserId)] || null;
@@ -718,12 +828,62 @@
             return state.core.api.inFlight[cacheKey];
         }
 
-        const promise = new Promise((resolve) => {
-            // scaffold only
+        const promise = new Promise(async (resolve) => {
+            const key = String(state.cfg.tornApiKey || '').trim();
+            if (!key) {
+                const fallbackResults = {};
+                for (const id of uniqueIds) {
+                    const cachedUser = state.core.users.byId[String(id)] || null;
+                    fallbackResults[String(id)] = {
+                        ok: false,
+                        usedApi: false,
+                        reason: 'missing_core_api_key',
+                        cachedUser,
+                    };
+                }
+                const noKeyData = {
+                    userIds: uniqueIds,
+                    usedApi: false,
+                    source: 'policy',
+                    reason: 'Missing Torn Core API key.',
+                    results: fallbackResults,
+                };
+                delete state.core.api.inFlight[cacheKey];
+                resolve({ ok: false, source: 'policy', data: noKeyData });
+                return;
+            }
+
+            const results = {};
+            for (const id of uniqueIds) {
+                const apiResult = await requestTornProfileApi(id, !!payload.forceFresh);
+                if (apiResult.ok) {
+                    ensureUserRecord(id, {
+                        torn: {
+                            status: apiResult.status || '',
+                            hospitalUntil: apiResult.hospitalUntil || 0,
+                            hospitalEtaText: apiResult.hospitalEtaText || '',
+                            lastRefreshAt: apiResult.fetchedAt || now(),
+                            source: 'torn_batch_api',
+                        }
+                    });
+                }
+
+                const merged = state.core.users.byId[String(id)] || null;
+                results[String(id)] = {
+                    ok: !!apiResult.ok,
+                    error: apiResult.error || null,
+                    errorCode: apiResult.errorCode || null,
+                    usedApi: true,
+                    torn: merged?.torn || null,
+                };
+            }
+
             const data = {
                 userIds: uniqueIds,
-                status: 'stub',
-                message: 'Torn batch broker scaffold ready. Wire actual batch request next.',
+                usedApi: true,
+                source: 'torn_batch_api',
+                refreshedAt: now(),
+                results,
             };
 
             state.core.api.cache.torn[cacheKey] = {
@@ -736,7 +896,7 @@
 
             resolve({
                 ok: true,
-                source: 'stub',
+                source: 'torn_batch_api',
                 data,
             });
         });
