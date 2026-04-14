@@ -1,0 +1,732 @@
+// ==UserScript==
+// @name         Torn Trade Chat Auto Poster
+// @namespace    torn.trade.autoposter
+// @version      3.0.0
+// @description  Auto-post a trade message in Torn Trade chat with manual leader tab selection, refresh-persistent leader, jittered timing, and minimize after post.
+// @match        https://www.torn.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /**********************************************************************
+     * Storage / Constants
+     **********************************************************************/
+    const STORAGE_KEYS = {
+        enabled: 'ttap_enabled',
+        message: 'ttap_message',
+        collapsed: 'ttap_collapsed',
+        panelX: 'ttap_panelX',
+        panelY: 'ttap_panelY',
+        manualLeaderId: 'ttap_manualLeaderId',
+        jitterMin: 'ttap_jitterMin',
+        jitterMax: 'ttap_jitterMax'
+    };
+
+    const SESSION_KEYS = {
+        tabId: 'ttap_session_tab_id'
+    };
+
+    const MIN_INTERVAL_SEC = 61;
+    const LOOP_MS = 1200;
+    const POST_OPEN_WAIT_MS = 700;
+    const POST_AFTER_FILL_MS = 180;
+    const POST_AFTER_SEND_MS = 400;
+    const POST_AFTER_MINIMIZE_MS = 250;
+
+    function getOrCreateSessionTabId() {
+        let id = sessionStorage.getItem(SESSION_KEYS.tabId);
+        if (!id) {
+            id = `tab_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+            sessionStorage.setItem(SESSION_KEYS.tabId, id);
+        }
+        return id;
+    }
+
+    const TAB_ID = getOrCreateSessionTabId();
+
+    let state = {
+        enabled: GM_getValue(STORAGE_KEYS.enabled, false),
+        message: GM_getValue(STORAGE_KEYS.message, ''),
+        collapsed: GM_getValue(STORAGE_KEYS.collapsed, false),
+        panelX: Number(GM_getValue(STORAGE_KEYS.panelX, 20)),
+        panelY: Number(GM_getValue(STORAGE_KEYS.panelY, 180)),
+        jitterMin: Math.max(MIN_INTERVAL_SEC, Number(GM_getValue(STORAGE_KEYS.jitterMin, 61)) || 61),
+        jitterMax: Math.max(MIN_INTERVAL_SEC, Number(GM_getValue(STORAGE_KEYS.jitterMax, 75)) || 75),
+        nextDelayMs: 0,
+        lastPostTs: 0,
+        postingNow: false
+    };
+
+    if (state.jitterMax < state.jitterMin) {
+        state.jitterMax = state.jitterMin;
+    }
+
+    /**********************************************************************
+     * Styles
+     **********************************************************************/
+    GM_addStyle(`
+        #ttap-panel {
+            position: fixed;
+            left: 20px;
+            top: 180px;
+            width: 330px;
+            z-index: 999999;
+            background: rgba(18, 22, 32, 0.96);
+            color: #eef3ff;
+            border: 1px solid rgba(120, 150, 255, 0.35);
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+            font-family: Arial, sans-serif;
+            user-select: none;
+            overflow: hidden;
+            backdrop-filter: blur(6px);
+        }
+
+        #ttap-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            font-weight: 700;
+            font-size: 14px;
+            background: rgba(40, 50, 74, 0.95);
+            cursor: move;
+        }
+
+        #ttap-header-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        #ttap-status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #777;
+            box-shadow: 0 0 8px rgba(255,255,255,0.15);
+            flex: 0 0 auto;
+        }
+
+        #ttap-status-dot.on {
+            background: #2ad66b;
+            box-shadow: 0 0 10px rgba(42,214,107,0.7);
+        }
+
+        #ttap-status-dot.wait {
+            background: #ffb347;
+            box-shadow: 0 0 10px rgba(255,179,71,0.65);
+        }
+
+        #ttap-collapse-btn {
+            border: 0;
+            background: rgba(255,255,255,0.08);
+            color: #eef3ff;
+            width: 28px;
+            height: 28px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1;
+        }
+
+        #ttap-body {
+            padding: 12px;
+        }
+
+        #ttap-panel.ttap-collapsed #ttap-body {
+            display: none;
+        }
+
+        .ttap-row {
+            margin-bottom: 10px;
+        }
+
+        .ttap-label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 12px;
+            color: #c9d4f5;
+        }
+
+        .ttap-input,
+        .ttap-textarea {
+            width: 100%;
+            box-sizing: border-box;
+            border: 1px solid rgba(140,160,255,0.25);
+            background: rgba(255,255,255,0.06);
+            color: #fff;
+            border-radius: 8px;
+            padding: 8px 10px;
+            outline: none;
+            font-size: 13px;
+        }
+
+        .ttap-input:focus,
+        .ttap-textarea:focus {
+            border-color: rgba(140,160,255,0.55);
+        }
+
+        .ttap-textarea {
+            min-height: 90px;
+            resize: vertical;
+            user-select: text;
+        }
+
+        .ttap-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .ttap-btn {
+            border: 0;
+            border-radius: 8px;
+            padding: 9px 10px;
+            cursor: pointer;
+            font-weight: 700;
+            font-size: 13px;
+            color: #fff;
+            background: rgba(90,120,255,0.85);
+        }
+
+        .ttap-btn.secondary {
+            background: rgba(255,255,255,0.09);
+        }
+
+        #ttap-info {
+            margin-top: 10px;
+            font-size: 12px;
+            line-height: 1.4;
+            color: #cbd5f3;
+            background: rgba(255,255,255,0.04);
+            padding: 8px 10px;
+            border-radius: 8px;
+            white-space: pre-line;
+        }
+
+        #ttap-leader {
+            transform: translateY(1px);
+        }
+    `);
+
+    /**********************************************************************
+     * Utils
+     **********************************************************************/
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function now() {
+        return Date.now();
+    }
+
+    function setValue(key, value) {
+        GM_setValue(key, value);
+    }
+
+    function getValue(key, fallback) {
+        return GM_getValue(key, fallback);
+    }
+
+    function formatRemaining(ms) {
+        const sec = Math.max(0, Math.ceil(ms / 1000));
+        const m = Math.floor(sec / 60);
+        const s = sec % 60;
+        return `${m}:${String(s).padStart(2, '0')}`;
+    }
+
+    function isVisible(el) {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            el.offsetWidth > 0 &&
+            el.offsetHeight > 0
+        );
+    }
+
+    function safeText(el) {
+        return (el?.textContent || '').trim();
+    }
+
+    function textIsTrade(text) {
+        return /^trade$/i.test((text || '').trim());
+    }
+
+    function textContainsTrade(text) {
+        return /\btrade\b/i.test((text || '').trim());
+    }
+
+    function fireInputEvents(el) {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function fireEnter(el) {
+        const events = ['keydown', 'keypress', 'keyup'];
+        for (const type of events) {
+            el.dispatchEvent(new KeyboardEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                key: 'Enter',
+                code: 'Enter',
+                which: 13,
+                keyCode: 13
+            }));
+        }
+    }
+
+    function setNativeValue(element, value) {
+        const proto = Object.getPrototypeOf(element);
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (descriptor && descriptor.set) {
+            descriptor.set.call(element, value);
+        } else {
+            element.value = value;
+        }
+    }
+
+    function randomDelayMs(minSec, maxSec) {
+        const min = Math.max(MIN_INTERVAL_SEC, Number(minSec) || MIN_INTERVAL_SEC);
+        const max = Math.max(min, Number(maxSec) || min);
+        return Math.floor((Math.random() * (max - min) + min) * 1000);
+    }
+
+    /**********************************************************************
+     * Manual leader system
+     **********************************************************************/
+    function getManualLeaderId() {
+        return String(getValue(STORAGE_KEYS.manualLeaderId, ''));
+    }
+
+    function isLeader() {
+        return getManualLeaderId() === TAB_ID;
+    }
+
+    function setLeader(enabled) {
+        if (enabled) {
+            setValue(STORAGE_KEYS.manualLeaderId, TAB_ID);
+        } else if (isLeader()) {
+            setValue(STORAGE_KEYS.manualLeaderId, '');
+        }
+    }
+
+    /**********************************************************************
+     * Trade targeting
+     **********************************************************************/
+    function findTradeChannelButton() {
+        const buttons = [...document.querySelectorAll('button[id^="channel_panel_button:"]')];
+
+        for (const btn of buttons) {
+            const title = (btn.getAttribute('title') || '').trim();
+            if (textIsTrade(title)) return btn;
+        }
+
+        for (const btn of buttons) {
+            if (textContainsTrade(safeText(btn))) return btn;
+        }
+
+        return null;
+    }
+
+    function findTradePanel() {
+        const candidatePanels = [
+            ...document.querySelectorAll('div[id="public_trade"]'),
+            ...document.querySelectorAll('div.root___FmdS_')
+        ];
+
+        for (const panel of candidatePanels) {
+            if (!isVisible(panel)) continue;
+
+            const titleEl = panel.querySelector('span.title___Bmq5P');
+            const textarea = panel.querySelector('textarea[placeholder="Type your message here..."], textarea.textarea___V8HsV');
+
+            if (titleEl && textIsTrade(safeText(titleEl)) && textarea) {
+                return panel;
+            }
+        }
+
+        const textareas = [...document.querySelectorAll('textarea[placeholder="Type your message here..."], textarea.textarea___V8HsV')];
+        for (const ta of textareas) {
+            const panel = ta.closest('div[id="public_trade"], div.root___FmdS_, div.visible___dJHqr');
+            if (!panel || !isVisible(panel)) continue;
+
+            const titleEl = panel.querySelector('span.title___Bmq5P');
+            if (titleEl && textIsTrade(safeText(titleEl))) {
+                return panel;
+            }
+        }
+
+        return null;
+    }
+
+    function findTradeTextareaWithin(panel) {
+        if (!panel) return null;
+
+        return panel.querySelector('textarea[placeholder="Type your message here..."]')
+            || panel.querySelector('textarea.textarea___V8HsV')
+            || null;
+    }
+
+    function findTradeSendButtonWithin(panel) {
+        if (!panel) return null;
+
+        const textarea = findTradeTextareaWithin(panel);
+        if (textarea?.parentElement) {
+            const btn = textarea.parentElement.querySelector('button.iconWrapper___tyRRU');
+            if (btn) return btn;
+        }
+
+        const buttons = [...panel.querySelectorAll('button')];
+        for (const btn of buttons) {
+            if (btn.querySelector('svg') && String(btn.className || '').includes('iconWrapper')) {
+                return btn;
+            }
+        }
+
+        return null;
+    }
+
+    function findTradeMinimizeButtonWithin(panel) {
+        if (!panel) return null;
+
+        const buttons = [...panel.querySelectorAll('button')];
+        for (const btn of buttons) {
+            const svg = btn.querySelector('svg[aria-label="Minimize"]');
+            if (svg) return btn;
+        }
+
+        const svg = panel.querySelector('svg[aria-label="Minimize"]');
+        return svg ? (svg.closest('button') || svg) : null;
+    }
+
+    async function ensureTradePanelOpen() {
+        let tradePanel = findTradePanel();
+        let textarea = findTradeTextareaWithin(tradePanel);
+
+        if (tradePanel && textarea && isVisible(textarea)) {
+            return tradePanel;
+        }
+
+        const tradeBtn = findTradeChannelButton();
+        if (!tradeBtn) return null;
+
+        tradeBtn.click();
+        await sleep(POST_OPEN_WAIT_MS);
+
+        tradePanel = findTradePanel();
+        textarea = findTradeTextareaWithin(tradePanel);
+
+        if (tradePanel && textarea && isVisible(textarea)) {
+            return tradePanel;
+        }
+
+        return null;
+    }
+
+    async function minimizeTradePanel(tradePanel) {
+        if (!tradePanel) return false;
+
+        const minBtn = findTradeMinimizeButtonWithin(tradePanel);
+        if (!minBtn) return false;
+
+        minBtn.click();
+        await sleep(POST_AFTER_MINIMIZE_MS);
+        return true;
+    }
+
+    /**********************************************************************
+     * Posting
+     **********************************************************************/
+    async function postMessageOnce(message) {
+        const tradePanel = await ensureTradePanelOpen();
+        if (!tradePanel) return { ok: false, reason: 'Could not open Trade panel.' };
+
+        const textarea = findTradeTextareaWithin(tradePanel);
+        if (!textarea) return { ok: false, reason: 'Trade textarea not found.' };
+
+        textarea.focus();
+        await sleep(100);
+
+        setNativeValue(textarea, message);
+        fireInputEvents(textarea);
+        await sleep(POST_AFTER_FILL_MS);
+
+        const sendBtn = findTradeSendButtonWithin(tradePanel);
+
+        if (sendBtn && !sendBtn.disabled) {
+            sendBtn.click();
+            await sleep(POST_AFTER_SEND_MS);
+        } else {
+            fireEnter(textarea);
+            await sleep(POST_AFTER_SEND_MS);
+        }
+
+        await minimizeTradePanel(tradePanel);
+
+        return { ok: true };
+    }
+
+    async function runPosterCycle() {
+        if (!state.enabled) return;
+        if (!isLeader()) return;
+        if (state.postingNow) return;
+
+        const msg = (state.message || '').trim();
+        if (!msg) return;
+
+        if (!state.nextDelayMs) {
+            state.nextDelayMs = randomDelayMs(state.jitterMin, state.jitterMax);
+        }
+
+        const dueAt = state.lastPostTs + state.nextDelayMs;
+        if (now() < dueAt) return;
+
+        state.postingNow = true;
+        updatePanel();
+
+        try {
+            const result = await postMessageOnce(msg);
+            if (result.ok) {
+                state.lastPostTs = now();
+                state.nextDelayMs = randomDelayMs(state.jitterMin, state.jitterMax);
+            } else {
+                console.warn('[TTAP] Post failed:', result.reason);
+            }
+        } catch (err) {
+            console.error('[TTAP] Unexpected posting error:', err);
+        } finally {
+            state.postingNow = false;
+            updatePanel();
+        }
+    }
+
+    /**********************************************************************
+     * UI
+     **********************************************************************/
+    const uiPanel = document.createElement('div');
+    uiPanel.id = 'ttap-panel';
+    uiPanel.innerHTML = `
+        <div id="ttap-header">
+            <div id="ttap-header-left">
+                <div id="ttap-status-dot"></div>
+                <div>Torn Trade Poster</div>
+            </div>
+            <button id="ttap-collapse-btn" title="Collapse / Expand">−</button>
+        </div>
+        <div id="ttap-body">
+            <div class="ttap-row">
+                <div class="ttap-grid">
+                    <div>
+                        <label class="ttap-label" for="ttap-jitter-min">Min delay (sec ≥ 61)</label>
+                        <input id="ttap-jitter-min" class="ttap-input" type="number" min="${MIN_INTERVAL_SEC}" step="1" value="${state.jitterMin}">
+                    </div>
+                    <div>
+                        <label class="ttap-label" for="ttap-jitter-max">Max delay (sec)</label>
+                        <input id="ttap-jitter-max" class="ttap-input" type="number" min="${MIN_INTERVAL_SEC}" step="1" value="${state.jitterMax}">
+                    </div>
+                </div>
+            </div>
+
+            <div class="ttap-row">
+                <label class="ttap-label" for="ttap-message">Trade message</label>
+                <textarea id="ttap-message" class="ttap-textarea" placeholder="Enter your trade text..."></textarea>
+            </div>
+
+            <div class="ttap-row">
+                <label class="ttap-label" style="display:flex;align-items:center;gap:8px;margin-bottom:0;">
+                    <input id="ttap-leader" type="checkbox" style="width:auto;">
+                    <span>Leader tab</span>
+                </label>
+            </div>
+
+            <div class="ttap-grid">
+                <button id="ttap-toggle" class="ttap-btn">${state.enabled ? 'Stop' : 'Start'}</button>
+                <button id="ttap-post-now" class="ttap-btn secondary">Post Now</button>
+            </div>
+
+            <div id="ttap-info"></div>
+        </div>
+    `;
+    document.body.appendChild(uiPanel);
+
+    const uiHeader = uiPanel.querySelector('#ttap-header');
+    const collapseBtn = uiPanel.querySelector('#ttap-collapse-btn');
+    const jitterMinInput = uiPanel.querySelector('#ttap-jitter-min');
+    const jitterMaxInput = uiPanel.querySelector('#ttap-jitter-max');
+    const messageInput = uiPanel.querySelector('#ttap-message');
+    const leaderCheckbox = uiPanel.querySelector('#ttap-leader');
+    const toggleBtn = uiPanel.querySelector('#ttap-toggle');
+    const postNowBtn = uiPanel.querySelector('#ttap-post-now');
+    const infoBox = uiPanel.querySelector('#ttap-info');
+    const statusDot = uiPanel.querySelector('#ttap-status-dot');
+
+    messageInput.value = state.message;
+    uiPanel.style.left = `${state.panelX}px`;
+    uiPanel.style.top = `${state.panelY}px`;
+
+    function applyCollapsedState() {
+        uiPanel.classList.toggle('ttap-collapsed', state.collapsed);
+        collapseBtn.textContent = state.collapsed ? '+' : '−';
+        setValue(STORAGE_KEYS.collapsed, state.collapsed);
+    }
+
+    function updatePanel() {
+        const leader = isLeader();
+        const dueAt = state.lastPostTs + (state.nextDelayMs || 0);
+        const remaining = Math.max(0, dueAt - now());
+
+        leaderCheckbox.checked = leader;
+
+        statusDot.classList.remove('on', 'wait');
+        if (state.enabled && leader) {
+            statusDot.classList.add(remaining > 0 || state.postingNow ? 'wait' : 'on');
+        }
+
+        toggleBtn.textContent = state.enabled ? 'Stop' : 'Start';
+
+        infoBox.textContent =
+            `Status: ${state.enabled ? (state.postingNow ? 'Posting...' : 'Running') : 'Stopped'}\n` +
+            `Leader tab: ${leader ? 'Yes' : 'No'}\n` +
+            `Next post: ${state.enabled ? (state.lastPostTs ? formatRemaining(remaining) : 'ready') : 'disabled'}\n` +
+            `Delay range: ${state.jitterMin}s → ${state.jitterMax}s\n` +
+            `Message length: ${(state.message || '').length}\n` +
+            `Tab ID: ${TAB_ID}`;
+    }
+
+    collapseBtn.addEventListener('click', () => {
+        state.collapsed = !state.collapsed;
+        applyCollapsedState();
+    });
+
+    jitterMinInput.addEventListener('change', () => {
+        state.jitterMin = Math.max(MIN_INTERVAL_SEC, Number(jitterMinInput.value) || MIN_INTERVAL_SEC);
+        if (state.jitterMax < state.jitterMin) {
+            state.jitterMax = state.jitterMin;
+        }
+
+        jitterMinInput.value = String(state.jitterMin);
+        jitterMaxInput.value = String(state.jitterMax);
+
+        setValue(STORAGE_KEYS.jitterMin, state.jitterMin);
+        setValue(STORAGE_KEYS.jitterMax, state.jitterMax);
+
+        state.nextDelayMs = 0;
+        updatePanel();
+    });
+
+    jitterMaxInput.addEventListener('change', () => {
+        state.jitterMax = Math.max(state.jitterMin, Number(jitterMaxInput.value) || state.jitterMin);
+
+        jitterMaxInput.value = String(state.jitterMax);
+
+        setValue(STORAGE_KEYS.jitterMax, state.jitterMax);
+
+        state.nextDelayMs = 0;
+        updatePanel();
+    });
+
+    messageInput.addEventListener('input', () => {
+        state.message = messageInput.value;
+        setValue(STORAGE_KEYS.message, state.message);
+        updatePanel();
+    });
+
+    leaderCheckbox.addEventListener('change', () => {
+        setLeader(leaderCheckbox.checked);
+        updatePanel();
+    });
+
+    toggleBtn.addEventListener('click', () => {
+        state.enabled = !state.enabled;
+        setValue(STORAGE_KEYS.enabled, state.enabled);
+        updatePanel();
+    });
+
+    postNowBtn.addEventListener('click', async () => {
+        const msg = (state.message || '').trim();
+        if (!msg) {
+            alert('Enter a message first.');
+            return;
+        }
+
+        if (!isLeader()) {
+            alert('This tab is not the leader tab.');
+            return;
+        }
+
+        state.postingNow = true;
+        updatePanel();
+
+        try {
+            const result = await postMessageOnce(msg);
+            if (result.ok) {
+                state.lastPostTs = now();
+                state.nextDelayMs = randomDelayMs(state.jitterMin, state.jitterMax);
+            } else {
+                alert(`Post failed: ${result.reason}`);
+            }
+        } catch (err) {
+            console.error(err);
+            alert('Post failed. Check console.');
+        } finally {
+            state.postingNow = false;
+            updatePanel();
+        }
+    });
+
+    /**********************************************************************
+     * Dragging
+     **********************************************************************/
+    let drag = null;
+
+    uiHeader.addEventListener('mousedown', (e) => {
+        if (e.target === collapseBtn) return;
+
+        const rect = uiPanel.getBoundingClientRect();
+        drag = {
+            offsetX: e.clientX - rect.left,
+            offsetY: e.clientY - rect.top
+        };
+
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!drag) return;
+
+        const x = Math.max(0, Math.min(window.innerWidth - uiPanel.offsetWidth, e.clientX - drag.offsetX));
+        const y = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - drag.offsetY));
+
+        uiPanel.style.left = `${x}px`;
+        uiPanel.style.top = `${y}px`;
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (!drag) return;
+
+        state.panelX = parseInt(uiPanel.style.left, 10) || 0;
+        state.panelY = parseInt(uiPanel.style.top, 10) || 0;
+        setValue(STORAGE_KEYS.panelX, state.panelX);
+        setValue(STORAGE_KEYS.panelY, state.panelY);
+
+        drag = null;
+    });
+
+    /**********************************************************************
+     * Init
+     **********************************************************************/
+    applyCollapsedState();
+    updatePanel();
+
+    setInterval(() => {
+        updatePanel();
+        runPosterCycle();
+    }, LOOP_MS);
+})();
