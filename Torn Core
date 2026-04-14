@@ -199,6 +199,15 @@
                     ff: {},
                 },
                 inFlight: {},
+                status: {
+                    tornApiKeyConfigured: false,
+                    ffApiKeyConfigured: false,
+                    tornLastSuccessAt: 0,
+                    ffLastSuccessAt: 0,
+                    tornLastError: '',
+                    ffLastError: '',
+                    updatedAt: 0,
+                },
                 stats: {
                     lastBatchTornAt: 0,
                     lastBatchFFAt: 0,
@@ -516,7 +525,10 @@
                 ts: Number(snapshot?.ts || now()),
                 leaderTabId: snapshot?.leaderTabId || null,
                 users: snapshot?.users || { byId: {} },
-                api: { stats: snapshot?.api?.stats || {} },
+                api: {
+                    stats: snapshot?.api?.stats || {},
+                    status: snapshot?.api?.status || {},
+                },
             });
         } catch (err) {
             log('Failed to publish bridge snapshot', err);
@@ -641,6 +653,12 @@
 
     function isFresh(entry, ttlMs) {
         return !!entry && (now() - Number(entry.ts || 0)) < ttlMs;
+    }
+
+    function refreshApiStatus() {
+        state.core.api.status.tornApiKeyConfigured = !!String(state.cfg.tornApiKey || '').trim();
+        state.core.api.status.ffApiKeyConfigured = !!String(state.cfg.ffApiKey || '').trim();
+        state.core.api.status.updatedAt = now();
     }
 
     function openIndexedDb(dbName) {
@@ -855,6 +873,8 @@
                 data,
             };
             state.core.api.stats.lastBatchFFAt = now();
+            state.core.api.status.ffLastSuccessAt = now();
+            state.core.api.status.ffLastError = '';
             delete state.core.api.inFlight[cacheKey];
             publishCore(true);
 
@@ -912,6 +932,7 @@
         const promise = new Promise(async (resolve) => {
             const key = String(state.cfg.tornApiKey || '').trim();
             if (!key) {
+                state.core.api.status.tornLastError = 'Missing Torn Core API key.';
                 const fallbackResults = {};
                 for (const id of uniqueIds) {
                     const cachedUser = state.core.users.byId[String(id)] || null;
@@ -972,6 +993,8 @@
                 data,
             };
             state.core.api.stats.lastBatchTornAt = now();
+            state.core.api.status.tornLastSuccessAt = now();
+            state.core.api.status.tornLastError = '';
             delete state.core.api.inFlight[cacheKey];
             publishCore(true);
 
@@ -1644,6 +1667,7 @@
         if (!state.cfg.enabled) return;
 
         maybeBecomeLeader();
+        refreshApiStatus();
         runPageAdapters();
 
         if (state.isLeader) {
@@ -1843,6 +1867,14 @@
                 <div class="tc-row"><span>Trade box</span><strong>${dom.trade.hasTradeTextbox ? 'Yes' : 'No'}</strong></div>
                 <div class="tc-row"><span>Hosp icon</span><strong>${dom.hospital.hasGlobalHospitalIcon ? 'Yes' : 'No'}</strong></div>
                 <div class="tc-row"><span>Attack detected</span><strong>${dom.combat.attackDetected ? 'Yes' : 'No'}</strong></div>
+            </div>
+
+            <div class="tc-section">
+                <div class="tc-row"><span>Torn key</span><strong class="${state.core.api.status.tornApiKeyConfigured ? 'tc-good' : 'tc-bad'}">${state.core.api.status.tornApiKeyConfigured ? 'Configured' : 'Missing'}</strong></div>
+                <div class="tc-row"><span>FF key</span><strong class="${state.core.api.status.ffApiKeyConfigured ? 'tc-good' : 'tc-bad'}">${state.core.api.status.ffApiKeyConfigured ? 'Configured' : 'Missing'}</strong></div>
+                <div class="tc-row"><span>Torn last success</span><strong>${state.core.api.status.tornLastSuccessAt ? new Date(state.core.api.status.tornLastSuccessAt).toLocaleTimeString() : '-'}</strong></div>
+                <div class="tc-row"><span>FF last success</span><strong>${state.core.api.status.ffLastSuccessAt ? new Date(state.core.api.status.ffLastSuccessAt).toLocaleTimeString() : '-'}</strong></div>
+                <div class="tc-small">${escapeHtml(state.core.api.status.tornLastError || state.core.api.status.ffLastError || '')}</div>
             </div>
 
             <div class="tc-section">
