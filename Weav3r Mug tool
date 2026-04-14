@@ -47,6 +47,7 @@
     tickTimer: null,
     thresholdValue: 0,
     trackerEls: null,
+    coreMode: false,
     tracker: {
       mode: "idle", // idle | baseline | tracking | alert
       running: false,
@@ -589,6 +590,12 @@
   }
 
   function queueIfNeeded(userId) {
+    if (state.coreMode) {
+      state.pendingTorn.add(userId);
+      state.pendingFF.add(userId);
+      return;
+    }
+
     const torn = state.tornCache.get(userId);
     const ff = state.ffCache.get(userId);
 
@@ -669,8 +676,9 @@
     const visible = state.sellers.size;
     const queuedTorn = state.pendingTorn.size;
     const queuedFF = state.pendingFF.size;
+    const backend = state.coreMode ? "TornCore" : "Direct API";
     line.textContent =
-      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Threshold: ${state.cfg.statThresholdText}`;
+      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Threshold: ${state.cfg.statThresholdText} | Backend: ${backend}`;
   }
 
   function takeFromSet(setObj, maxCount) {
@@ -700,6 +708,77 @@
         ontimeout: () => reject(new Error("Request timed out")),
       });
     });
+  }
+
+  function getTornCore() {
+    const core = window.TornCore;
+    if (!core || typeof core.getUser !== "function") {
+      return null;
+    }
+    if (typeof core.requestUsersFFRefresh !== "function" || typeof core.requestUsersTornRefresh !== "function") {
+      return null;
+    }
+    return core;
+  }
+
+  function syncSellerFromCore(userId) {
+    const core = getTornCore();
+    if (!core) return;
+
+    const user = core.getUser(userId);
+    if (!user) return;
+
+    if (user.torn) {
+      state.tornCache.set(userId, {
+        status: String(user.torn.status || "").trim(),
+        raw: user.torn,
+        ts: Number(user.torn.lastRefreshAt || 0) || now(),
+      });
+    }
+
+    if (user.ff) {
+      state.ffCache.set(userId, {
+        bs_estimate: Number.isFinite(user.ff.estimatedStats) ? user.ff.estimatedStats : null,
+        bs_estimate_human: user.ff.estimatedStatsHuman || null,
+        fair_fight: null,
+        raw: user.ff,
+        ts: Number(user.ff.lastRefreshAt || 0) || now(),
+      });
+    }
+  }
+
+  async function fetchFFBatchFromCore(userIds) {
+    const core = getTornCore();
+    if (!core || !userIds.length) return;
+    try {
+      await core.requestUsersFFRefresh(userIds);
+      for (const userId of userIds) {
+        syncSellerFromCore(userId);
+        renderSeller(userId);
+      }
+    } catch (err) {
+      log("Core FF batch failed:", err);
+      for (const userId of userIds) {
+        state.pendingFF.add(userId);
+      }
+    }
+  }
+
+  async function fetchTornBatchFromCore(userIds) {
+    const core = getTornCore();
+    if (!core || !userIds.length) return;
+    try {
+      await core.requestUsersTornRefresh(userIds, { forceSingleApi: true });
+      for (const userId of userIds) {
+        syncSellerFromCore(userId);
+        renderSeller(userId);
+      }
+    } catch (err) {
+      log("Core Torn batch failed:", err);
+      for (const userId of userIds) {
+        state.pendingTorn.add(userId);
+      }
+    }
   }
 
   async function fetchFFBatch(userIds) {
@@ -788,11 +867,15 @@
     const ffIds = takeFromSet(state.pendingFF, batchSize);
     const tornIds = takeFromSet(state.pendingTorn, batchSize);
 
-    if (ffIds.length) {
+    if (ffIds.length && state.coreMode) {
+      fetchFFBatchFromCore(ffIds);
+    } else if (ffIds.length) {
       fetchFFBatch(ffIds);
     }
 
-    if (tornIds.length) {
+    if (tornIds.length && state.coreMode) {
+      fetchTornBatchFromCore(tornIds);
+    } else if (tornIds.length) {
       Promise.allSettled(tornIds.map(fetchTornStatus)).then(() => {
         for (const id of tornIds) renderSeller(id);
       });
@@ -1055,6 +1138,8 @@
   }
 
   function init() {
+    state.coreMode = !!(location.hostname === "www.torn.com" && getTornCore());
+
     if (isTornBazaarPage()) {
       loadBazaarSessionState();
       buildBazaarPanel();
