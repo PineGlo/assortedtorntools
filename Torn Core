@@ -1706,6 +1706,11 @@
         restartDomLoop();
     }
 
+    function isEditingSettingsInputs() {
+        const activeId = document.activeElement?.id || '';
+        return activeId === 'tc-torn-key' || activeId === 'tc-ff-key';
+    }
+
     function createPanel() {
         if (!state.cfg.showPanel) return;
 
@@ -1857,7 +1862,8 @@
         renderPanel();
     }
 
-    function renderPanel() {
+    function renderPanel(force = false) {
+        if (!force && isEditingSettingsInputs()) return;
         if (!state.panelBody) return;
 
         const dom = state.core.dom;
@@ -1927,7 +1933,7 @@
                 state.cfg.ffApiKey = ffKey;
                 saveSettings();
                 refreshApiStatus();
-                renderPanel();
+                renderPanel(true);
             });
         }
     }
