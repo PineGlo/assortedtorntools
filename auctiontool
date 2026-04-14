@@ -1975,6 +1975,9 @@ function parseCurrentListingPrice() {
 
     function injectInto(containers, checkRarity = true) {
         containers.forEach(el => {
+            const parsed = parseReactItem(el);
+            const bbAmount = calcBunkerBucks(parsed.itemName, getRarityKey(el), parsed.bonuses.length, parsed.itemType);
+            injectBBBage(el, bbAmount);
             if (el.querySelector('.ah-btn')) return;
             if (checkRarity && !hasRarity(el)) return;
             const wrap = el.querySelector('.descriptionWrapper___Lh0y0,[class*="itemInfo___"]') || el;
@@ -1984,8 +1987,6 @@ function parseCurrentListingPrice() {
     }
 
     function injectAuction() {
-        injectCollapsedAuctionButtons();
-
         for (const sel of ['.itemInfoWrapper___nA_eu','[class*="itemInfoWrapper"]','[class*="itemInfo___"]']) {
             const els = document.querySelectorAll(sel);
             if (!els.length) continue;
@@ -1997,7 +1998,7 @@ function parseCurrentListingPrice() {
                 if (el.querySelector('.ah-btn')) return;
                 const wrap = el.querySelector('.descriptionWrapper___Lh0y0') || el;
                 wrap.appendChild(makeBtn(() => {
-                    const d = parsed.itemName ? parsed : parseReactItem(el);
+                    const d = parseReactItem(el);
                     document.querySelectorAll('.ah-open-source').forEach(x => x.classList.remove('ah-open-source'));
                     el.classList.add('ah-open-source');
                     openModal(d.itemName, d.bonuses, d.quality, d.itemType, d.srcStats);
@@ -2018,15 +2019,17 @@ function parseCurrentListingPrice() {
             const wrap = li.querySelector('.descriptionWrapper___Lh0y0') || exp;
             wrap.style.position = 'relative';
             wrap.appendChild(makeBtn(() => {
-                const d = parseReactItem(el);
+                const d = parseLegacyItem(li);
                 document.querySelectorAll('.ah-open-source').forEach(x => x.classList.remove('ah-open-source'));
-                el.classList.add('ah-open-source');
+                li.classList.add('ah-open-source');
                 openModal(d.itemName, d.bonuses, d.quality, d.itemType, d.srcStats);
             }));
         });
     }
 
     function injectButtons() {
+        injectCollapsedAuctionButtons();
+
         const pt = getPageType();
         if (pt === 'auction') {
             injectAuction();
