@@ -1926,6 +1926,8 @@
                 state.cfg.tornApiKey = tornKey;
                 state.cfg.ffApiKey = ffKey;
                 saveSettings();
+                refreshApiStatus();
+                renderPanel();
             });
         }
     }
@@ -1972,6 +1974,8 @@
         }, Math.max(500, Number(state.cfg.leaderHeartbeatMs) || 1500));
 
         state.loops.ui = setInterval(() => {
+            const activeId = document.activeElement?.id || '';
+            if (activeId === 'tc-torn-key' || activeId === 'tc-ff-key') return;
             renderPanel();
         }, 1000);
 
