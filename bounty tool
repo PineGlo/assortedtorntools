@@ -541,7 +541,7 @@
 
         const apiKeyRow = createEl('div', { className: 'bha-row' }, [
             createEl('label', {}, [
-                document.createTextNode('Torn API key'),
+                document.createTextNode('Torn API key (legacy)'),
                 createEl('input', {
                     type: 'password',
                     value: state.settings.apiKey || '',
@@ -610,7 +610,7 @@
 
         const disclosure = createEl('div', {
             className: 'bha-disclosure',
-            text: 'This prefers Torn Core shared cache/broker first. Local API key stays in your browser and is used as fallback.'
+            text: 'Hospital/API refresh is now Core-owned. Enable Torn Core + broker to drive timers and status refresh.'
         });
 
         const help = createEl('div', {
@@ -754,7 +754,7 @@
     }
 
     function hasUsableLocalApiKey() {
-        return state.settings.apiEnabled && String(state.settings.apiKey || '').trim().length >= 8;
+        return false;
     }
 
     function canUseCoreBroker() {
@@ -767,7 +767,7 @@
     }
 
     function hasAnyApiSource() {
-        return hasUsableLocalApiKey() || canUseCoreBroker();
+        return canUseCoreBroker();
     }
 
     function convertUntilToMs(until) {
@@ -799,7 +799,8 @@
         try {
             await window.TornCore.request('user.refresh.torn.batch', {
                 userIds: [Number(playerId)],
-                forceFresh: !!forceFresh
+                forceFresh: !!forceFresh,
+                forceSingleApi: !!forceFresh
             });
         } catch {}
 
@@ -959,11 +960,8 @@
         let result;
         if (canUseCoreBroker()) {
             result = await requestTornProfileViaCore(next.playerId, next.force);
-            if (!result?.ok && hasUsableLocalApiKey()) {
-                result = await requestTornProfile(next.playerId, next.force);
-            }
         } else {
-            result = await requestTornProfile(next.playerId, next.force);
+            result = { ok: false, error: 'Core broker unavailable', playerId: next.playerId };
         }
 
         state.apiCache.set(Number(next.playerId), {
@@ -1368,11 +1366,8 @@
         let result;
         if (canUseCoreBroker()) {
             result = await requestTornProfileViaCore(playerId, true);
-            if (!result?.ok && hasUsableLocalApiKey()) {
-                result = await requestTornProfile(playerId, true);
-            }
         } else {
-            result = await requestTornProfile(playerId, true);
+            result = { ok: false, error: 'Core broker unavailable', playerId };
         }
         state.attackHospital.refreshInFlight = false;
         if (!result || !result.ok) return;
