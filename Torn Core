@@ -478,9 +478,30 @@
         return JSON.parse(JSON.stringify(state.core));
     }
 
+    function ensureCoreShape() {
+        if (!state.core.api) state.core.api = {};
+        if (!state.core.api.cache) state.core.api.cache = { torn: {}, ff: {} };
+        if (!state.core.api.inFlight) state.core.api.inFlight = {};
+        if (!state.core.api.stats) {
+            state.core.api.stats = { lastBatchTornAt: 0, lastBatchFFAt: 0 };
+        }
+        if (!state.core.api.status) {
+            state.core.api.status = {
+                tornApiKeyConfigured: false,
+                ffApiKeyConfigured: false,
+                tornLastSuccessAt: 0,
+                ffLastSuccessAt: 0,
+                tornLastError: '',
+                ffLastError: '',
+                updatedAt: 0,
+            };
+        }
+    }
+
     function applySnapshot(snapshot) {
         if (!snapshot || typeof snapshot !== 'object') return;
         state.core = snapshot;
+        ensureCoreShape();
     }
 
     function persistSnapshot(snapshot) {
@@ -495,6 +516,7 @@
     }
 
     function publishCore(force = false) {
+        ensureCoreShape();
         const snapshot = snapshotCore();
         const json = JSON.stringify(snapshot);
         const heartbeatDue = (now() - state.lastPublishedAt) >= state.cfg.heartbeatPublishMs;
@@ -537,7 +559,8 @@
 
     function appendBridgeResponse(item) {
         try {
-            const responses = GM_getValue(BRIDGE_KEYS.responses, []) || [];
+            const raw = GM_getValue(BRIDGE_KEYS.responses, []);
+            const responses = Array.isArray(raw) ? raw : [];
             responses.push(item);
             GM_setValue(BRIDGE_KEYS.responses, responses.slice(-200));
         } catch (err) {
@@ -547,10 +570,12 @@
 
     function processBridgeRequests() {
         if (!state.isLeader) return;
-        const requests = GM_getValue(BRIDGE_KEYS.requests, []) || [];
+        const rawRequests = GM_getValue(BRIDGE_KEYS.requests, []);
+        const requests = Array.isArray(rawRequests) ? rawRequests : [];
         if (!Array.isArray(requests) || !requests.length) return;
 
-        const responses = GM_getValue(BRIDGE_KEYS.responses, []) || [];
+        const rawResponses = GM_getValue(BRIDGE_KEYS.responses, []);
+        const responses = Array.isArray(rawResponses) ? rawResponses : [];
         const responded = new Set(responses.map((r) => r?.requestId).filter(Boolean));
 
         requests.forEach((req) => {
@@ -656,6 +681,7 @@
     }
 
     function refreshApiStatus() {
+        ensureCoreShape();
         state.core.api.status.tornApiKeyConfigured = !!String(state.cfg.tornApiKey || '').trim();
         state.core.api.status.ffApiKeyConfigured = !!String(state.cfg.ffApiKey || '').trim();
         state.core.api.status.updatedAt = now();
@@ -1924,6 +1950,7 @@
 
     function init() {
         setupBroadcastChannel();
+        ensureCoreShape();
 
         const snap = loadSnapshot();
         if (snap && !state.isLeader) {
