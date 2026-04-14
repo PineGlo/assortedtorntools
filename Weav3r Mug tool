@@ -5,10 +5,9 @@
 // @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links.
 // @match        https://weav3r.dev/item/*
 // @match        https://www.torn.com/bazaar.php*
-// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        GM_addStyle
-// @connect      api.torn.com
-// @connect      ffscouter.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -18,6 +17,7 @@
   const STORAGE_KEY = "weav3r_mugging_helper_v1";
   const DEFAULTS = {
     enabled: true,
+    useCoreBackend: true,
     enableBazaarTracking: true,
     bazaarScanMs: 1000,
     bazaarAutoRefresh: true,
@@ -25,23 +25,26 @@
     bazaarRefreshJitterPct: 20,
     soldAlertUnits: 250,
     rapidJumpUnits: 40,
-    tornApiKey: "",
-    ffApiKey: "",
     statThresholdText: "500m",
-    batchSize: 10,
-    tickMs: 8000,
-    tornTtlMs: 60 * 1000,
-    ffTtlMs: 60 * 60 * 1000,
+    batchSize: 15,
+    tickMs: 6000,
     debug: false,
+  };
+
+  const CORE_STALE = {
+    tornMs: 60 * 1000,
+    ffMs: 60 * 60 * 1000,
   };
 
   const state = {
     cfg: loadConfig(),
     sellers: new Map(),      // userId -> seller object
-    tornCache: new Map(),    // userId -> { status, ts, raw }
-    ffCache: new Map(),      // userId -> { bs_estimate, bs_estimate_human, fair_fight, ts, raw }
-    pendingTorn: new Set(),
-    pendingFF: new Set(),
+    coreClient: null,
+    coreMode: "offline", // direct | bridge | offline
+    bridgeSnapshotTs: 0,
+    domBridgeSnapshot: null,
+    domBridgeTimer: null,
+    lastPlan: { needTorn: 0, needFF: 0 },
     observer: null,
     scanTimer: null,
     tickTimer: null,
@@ -240,6 +243,10 @@
     .wmh-row-good {
       outline: 1px solid rgba(74, 222, 128, 0.6) !important;
       box-shadow: inset 0 0 0 9999px rgba(22, 101, 52, 0.15);
+    }
+    .wmh-row-bad {
+      outline: 1px solid rgba(248, 113, 113, 0.55) !important;
+      box-shadow: inset 0 0 0 9999px rgba(127, 29, 29, 0.12);
     }
   `);
 
@@ -497,10 +504,6 @@
     return Date.now();
   }
 
-  function isFresh(entry, ttlMs) {
-    return !!entry && (now() - entry.ts) < ttlMs;
-  }
-
   function debounce(fn, wait) {
     let t = null;
     return (...args) => {
@@ -588,35 +591,35 @@
     }
   }
 
-  function queueIfNeeded(userId) {
-    const torn = state.tornCache.get(userId);
-    const ff = state.ffCache.get(userId);
-
-    if (!isFresh(torn, state.cfg.tornTtlMs)) state.pendingTorn.add(userId);
-    if (!isFresh(ff, state.cfg.ffTtlMs)) state.pendingFF.add(userId);
-  }
-
   function scanPage() {
     const anchors = findSellerAnchors();
     for (const anchor of anchors) {
       const userId = parseUserIdFromHref(anchor.href);
       if (!userId) continue;
       ensureSeller(userId, anchor);
-      queueIfNeeded(userId);
       renderSeller(userId);
     }
     runBazaarTracker();
     updateStatusLine();
   }
 
-  function getTornStatusText(json) {
-    return (
-      json?.status?.description ||
-      json?.status?.details ||
-      json?.status?.state ||
-      json?.status ||
-      ""
-    );
+  function mapCoreUserToSellerTruth(userId) {
+    const coreUser = state.coreClient?.getUser?.(userId) || null;
+    const torn = coreUser?.torn || null;
+    const ff = coreUser?.ff || null;
+    const tornAt = Number(torn?.lastRefreshAt) || 0;
+    const ffAt = Number(ff?.lastRefreshAt) || 0;
+    const tornFresh = tornAt && (now() - tornAt) <= CORE_STALE.tornMs;
+    const ffFresh = ffAt && (now() - ffAt) <= CORE_STALE.ffMs;
+
+    return {
+      status: torn?.status || "",
+      estimatedStats: Number.isFinite(ff?.estimatedStats) ? ff.estimatedStats : null,
+      estimatedStatsHuman: ff?.estimatedStatsHuman || "",
+      tornFresh: !!tornFresh,
+      ffFresh: !!ffFresh,
+      stale: !tornFresh || !ffFresh,
+    };
   }
 
   function renderSeller(userId) {
@@ -625,40 +628,32 @@
 
     ensureSellerUi(seller);
 
-    const torn = state.tornCache.get(userId);
-    const ff = state.ffCache.get(userId);
-    const statusText = torn?.status || "…";
-    const bs = ff?.bs_estimate;
+    const truth = mapCoreUserToSellerTruth(userId);
+    const statusText = truth.status || "…";
+    const bs = truth.estimatedStats;
     const threshold = state.thresholdValue;
     const okay = statusText === "Okay";
     const underCap = Number.isFinite(bs) && bs <= threshold;
     const good = okay && underCap;
+    const evaluable = !!truth.status && Number.isFinite(bs);
+    const bad = evaluable && !good;
+    const bsText = truth.estimatedStatsHuman || (Number.isFinite(bs) ? humanizeNumber(bs) : "?");
 
     if (seller.badgeEl) {
       seller.badgeEl.className = "wmh-badge neutral";
-
-      if (!torn && !ff) {
-        seller.badgeEl.textContent = "Checking...";
-      } else if (torn && !ff) {
-        seller.badgeEl.textContent = `${statusText} | FF...`;
-        seller.badgeEl.classList.add(statusText === "Okay" ? "ok" : "bad");
-      } else if (!torn && ff) {
-        seller.badgeEl.textContent = `...? | ${ff.bs_estimate_human || humanizeNumber(ff.bs_estimate)}`;
+      seller.badgeEl.textContent = `${truth.status || "Unknown"} | ${bsText}`;
+      if (good) {
+        seller.badgeEl.classList.add("ok");
+      } else if (bad) {
+        seller.badgeEl.classList.add("bad");
       } else {
-        const bsText = ff.bs_estimate_human || humanizeNumber(ff.bs_estimate);
-        seller.badgeEl.textContent = `${statusText} | ${bsText}`;
-        if (good) {
-          seller.badgeEl.classList.add("ok");
-        } else if (statusText !== "Okay" || (Number.isFinite(bs) && bs > threshold)) {
-          seller.badgeEl.classList.add("bad");
-        } else {
-          seller.badgeEl.classList.add("neutral");
-        }
+        seller.badgeEl.classList.add("neutral");
       }
     }
 
     if (seller.row) {
       seller.row.classList.toggle("wmh-row-good", good);
+      seller.row.classList.toggle("wmh-row-bad", bad);
     }
   }
 
@@ -667,135 +662,139 @@
     if (!line) return;
 
     const visible = state.sellers.size;
-    const queuedTorn = state.pendingTorn.size;
-    const queuedFF = state.pendingFF.size;
+    const queuedTorn = state.lastPlan.needTorn;
+    const queuedFF = state.lastPlan.needFF;
+    const coreState = state.coreMode;
     line.textContent =
-      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Threshold: ${state.cfg.statThresholdText}`;
+      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Backend: ${coreState} | Threshold: ${state.cfg.statThresholdText}`;
   }
 
-  function takeFromSet(setObj, maxCount) {
-    const out = [];
-    for (const value of setObj) {
-      out.push(value);
-      if (out.length >= maxCount) break;
+  function createCoreClient() {
+    if (state.cfg.useCoreBackend && window.TornCore?.request) {
+      return {
+        mode: "direct",
+        getUser: (userId) => window.TornCore.getUser?.(userId) || null,
+        subscribe: (cb) => window.TornCore.subscribe ? window.TornCore.subscribe(cb) : (() => {}),
+        requestUsersFFRefresh: (userIds) => window.TornCore.request("user.refresh.ff.batch", { userIds }),
+        requestUsersTornRefresh: (userIds, opts = {}) => window.TornCore.request("user.refresh.torn.batch", { userIds, ...opts }),
+      };
     }
-    out.forEach(v => setObj.delete(v));
-    return out;
+
+    if (state.domBridgeSnapshot?.users?.byId) {
+      return {
+        mode: "bridge_dom",
+        getUser: (userId) => state.domBridgeSnapshot?.users?.byId?.[String(userId)] || null,
+        subscribe: () => (() => {}),
+        requestUsersFFRefresh: (userIds) => requestDomBridge("user.refresh.ff.batch", { userIds }),
+        requestUsersTornRefresh: (userIds, opts = {}) => requestDomBridge("user.refresh.torn.batch", { userIds, ...opts }),
+      };
+    }
+
+    const bridgeSnapshotKey = "torn_core_v2_bridge_snapshot";
+    const bridgeRequestKey = "torn_core_v2_bridge_requests";
+    const bridgeResponseKey = "torn_core_v2_bridge_responses";
+
+    const readSnapshot = () => GM_getValue(bridgeSnapshotKey, null);
+    if (readSnapshot()?.users?.byId) {
+      return {
+        mode: "bridge",
+        getUser: (userId) => {
+          const snapshot = readSnapshot();
+          return snapshot?.users?.byId?.[String(userId)] || null;
+        },
+        subscribe: (cb) => {
+          let lastTs = state.bridgeSnapshotTs;
+          const timer = setInterval(() => {
+            const snapshot = readSnapshot();
+            const ts = Number(snapshot?.ts || 0);
+            if (ts && ts !== lastTs) {
+              lastTs = ts;
+              state.bridgeSnapshotTs = ts;
+              cb(snapshot);
+            }
+          }, 2000);
+          return () => clearInterval(timer);
+        },
+        requestUsersFFRefresh: (userIds) => requestBridgeBroker(bridgeRequestKey, bridgeResponseKey, "user.refresh.ff.batch", { userIds }),
+        requestUsersTornRefresh: (userIds, opts = {}) => requestBridgeBroker(bridgeRequestKey, bridgeResponseKey, "user.refresh.torn.batch", { userIds, ...opts }),
+      };
+    }
+
+    return {
+      mode: "offline",
+      getUser: () => null,
+      subscribe: () => (() => {}),
+      requestUsersFFRefresh: async () => ({ ok: false, error: "No Torn Core client available." }),
+      requestUsersTornRefresh: async () => ({ ok: false, error: "No Torn Core client available." }),
+    };
   }
 
-  function gmGet(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: "GET",
-        url,
-        timeout: 20000,
-        onload: (resp) => {
-          if (resp.status >= 200 && resp.status < 300) {
-            resolve(resp);
-          } else {
-            reject(new Error(`HTTP ${resp.status}: ${resp.responseText || "request failed"}`));
-          }
-        },
-        onerror: (err) => reject(err),
-        ontimeout: () => reject(new Error("Request timed out")),
-      });
+  function requestBridgeBroker(requestKey, responseKey, type, payload) {
+    const requestId = `wmh_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const queue = GM_getValue(requestKey, []);
+    queue.push({ id: requestId, type, payload, createdAt: now(), requester: "weav3r_mug_tool" });
+    GM_setValue(requestKey, queue.slice(-100));
+
+    return new Promise((resolve) => {
+      const started = now();
+      const timer = setInterval(() => {
+        const responses = GM_getValue(responseKey, []);
+        const hit = responses.find((item) => item?.requestId === requestId);
+        if (hit) {
+          clearInterval(timer);
+          resolve(hit.result || { ok: false, error: "Empty bridge response." });
+          return;
+        }
+        if ((now() - started) > 9000) {
+          clearInterval(timer);
+          resolve({ ok: false, timeout: true, error: "Bridge request timeout." });
+        }
+      }, 300);
     });
   }
 
-  async function fetchFFBatch(userIds) {
-    if (!state.cfg.ffApiKey || !userIds.length) return;
-    const url =
-      `https://ffscouter.com/api/v1/get-stats?key=${encodeURIComponent(state.cfg.ffApiKey)}&targets=${encodeURIComponent(userIds.join(","))}`;
-
-    try {
-      const resp = await gmGet(url);
-      const data = JSON.parse(resp.responseText);
-      if (!Array.isArray(data)) {
-        log("Unexpected FF response:", data);
-        return;
-      }
-
-      const seen = new Set();
-      for (const item of data) {
-        if (!item || !item.player_id) continue;
-        seen.add(Number(item.player_id));
-        state.ffCache.set(Number(item.player_id), {
-          bs_estimate: Number.isFinite(item.bs_estimate) ? item.bs_estimate : null,
-          bs_estimate_human: item.bs_estimate_human || null,
-          fair_fight: Number.isFinite(item.fair_fight) ? item.fair_fight : null,
-          raw: item,
-          ts: now(),
-        });
-        renderSeller(Number(item.player_id));
-      }
-
-      for (const userId of userIds) {
-        if (!seen.has(userId)) {
-          state.ffCache.set(userId, {
-            bs_estimate: null,
-            bs_estimate_human: null,
-            fair_fight: null,
-            raw: null,
-            ts: now(),
-          });
-          renderSeller(userId);
-        }
-      }
-    } catch (err) {
-      log("FF batch failed:", err);
-      for (const userId of userIds) {
-        state.pendingFF.add(userId);
-      }
-    }
-  }
-
-  async function fetchTornStatus(userId) {
-    if (!state.cfg.tornApiKey || !userId) return;
-
-    // Old-style endpoint kept deliberately because it is simple and widely supported.
-    const url =
-      `https://api.torn.com/user/${userId}?selections=profile&key=${encodeURIComponent(state.cfg.tornApiKey)}`;
-
-    try {
-      const resp = await gmGet(url);
-      const data = JSON.parse(resp.responseText);
-
-      if (data?.error) {
-        log(`Torn API error for ${userId}:`, data.error);
-        return;
-      }
-
-      const status = String(getTornStatusText(data) || "").trim();
-      state.tornCache.set(userId, {
-        status,
-        raw: data,
-        ts: now(),
-      });
-      renderSeller(userId);
-    } catch (err) {
-      log(`Torn status failed for ${userId}:`, err);
-      state.pendingTorn.add(userId);
-    }
+  function requestDomBridge(type, payload = {}) {
+    const id = `wmh_dom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise((resolve) => {
+      const onResponse = (event) => {
+        const detail = event?.detail || {};
+        if (detail.id !== id) return;
+        window.removeEventListener("torn-core-bridge-response", onResponse);
+        resolve(detail.result || { ok: false, error: "Empty DOM bridge response." });
+      };
+      window.addEventListener("torn-core-bridge-response", onResponse);
+      window.dispatchEvent(new CustomEvent("torn-core-bridge-request", {
+        detail: { id, type, payload },
+      }));
+      setTimeout(() => {
+        window.removeEventListener("torn-core-bridge-response", onResponse);
+        resolve({ ok: false, timeout: true, error: "DOM bridge timeout." });
+      }, 2500);
+    });
   }
 
   async function processQueues() {
     if (!state.cfg.enabled) return;
+    state.coreClient = createCoreClient();
+    state.coreMode = state.coreClient.mode;
 
     scanPage();
 
-    const batchSize = Math.max(1, Number(state.cfg.batchSize) || 10);
-
-    const ffIds = takeFromSet(state.pendingFF, batchSize);
-    const tornIds = takeFromSet(state.pendingTorn, batchSize);
-
-    if (ffIds.length) {
-      fetchFFBatch(ffIds);
+    const needFF = [];
+    const needTorn = [];
+    const batchSize = Math.max(1, Number(state.cfg.batchSize) || 15);
+    for (const seller of state.sellers.values()) {
+      const truth = mapCoreUserToSellerTruth(seller.userId);
+      if (!truth.ffFresh) needFF.push(seller.userId);
+      if (!truth.tornFresh) needTorn.push(seller.userId);
     }
+    state.lastPlan = { needTorn: needTorn.length, needFF: needFF.length };
 
-    if (tornIds.length) {
-      Promise.allSettled(tornIds.map(fetchTornStatus)).then(() => {
-        for (const id of tornIds) renderSeller(id);
-      });
+    if (needFF.length) {
+      state.coreClient.requestUsersFFRefresh(needFF.slice(0, batchSize)).catch((err) => log("FF refresh failed", err));
+    }
+    if (needTorn.length) {
+      state.coreClient.requestUsersTornRefresh(needTorn.slice(0, batchSize)).catch((err) => log("Torn refresh failed", err));
     }
 
     updateStatusLine();
@@ -822,15 +821,7 @@
         <span id="wmh-collapse-indicator">▾</span>
       </div>
       <div class="wmh-body">
-        <div class="wmh-row">
-          <label for="wmh-torn-key">Torn API key</label>
-          <input id="wmh-torn-key" type="password" placeholder="Your Torn API key">
-        </div>
-
-        <div class="wmh-row">
-          <label for="wmh-ff-key">FF Scouter API key</label>
-          <input id="wmh-ff-key" type="password" placeholder="Your FF Scouter key">
-        </div>
+        <div class="wmh-statusline">Backend: Torn Core client (direct or bridge)</div>
 
         <div class="wmh-row">
           <label for="wmh-threshold">Max estimated stats</label>
@@ -863,45 +854,30 @@
     `;
     document.body.appendChild(panel);
 
-    const tornKey = panel.querySelector("#wmh-torn-key");
-    const ffKey = panel.querySelector("#wmh-ff-key");
     const threshold = panel.querySelector("#wmh-threshold");
     const batch = panel.querySelector("#wmh-batch");
     const tick = panel.querySelector("#wmh-tick");
     const enabled = panel.querySelector("#wmh-enabled");
 
-    tornKey.value = state.cfg.tornApiKey || "";
-    ffKey.value = state.cfg.ffApiKey || "";
     threshold.value = state.cfg.statThresholdText || "";
-    batch.value = String(state.cfg.batchSize || 10);
-    tick.value = String(state.cfg.tickMs || 8000);
+    batch.value = String(state.cfg.batchSize || 15);
+    tick.value = String(state.cfg.tickMs || 6000);
     enabled.checked = !!state.cfg.enabled;
 
     panel.querySelector("#wmh-save").addEventListener("click", () => {
-      state.cfg.tornApiKey = tornKey.value.trim();
-      state.cfg.ffApiKey = ffKey.value.trim();
       state.cfg.statThresholdText = threshold.value.trim();
-      state.cfg.batchSize = Math.max(1, Number(batch.value) || 10);
-      state.cfg.tickMs = Math.max(1000, Number(tick.value) || 8000);
+      state.cfg.batchSize = Math.max(1, Number(batch.value) || 15);
+      state.cfg.tickMs = Math.max(1000, Number(tick.value) || 6000);
       state.cfg.enabled = !!enabled.checked;
 
       state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
       saveConfig();
 
-      // Requeue all visible sellers after config change
-      for (const userId of state.sellers.keys()) {
-        state.pendingTorn.add(userId);
-        state.pendingFF.add(userId);
-      }
       processQueues();
       startLoop();
     });
 
     panel.querySelector("#wmh-refresh").addEventListener("click", () => {
-      for (const userId of state.sellers.keys()) {
-        state.pendingTorn.add(userId);
-        state.pendingFF.add(userId);
-      }
       processQueues();
     });
 
@@ -1054,6 +1030,29 @@
     runBazaarTracker();
   }
 
+  function setupCoreSubscription() {
+    state.coreClient = createCoreClient();
+    state.coreMode = state.coreClient.mode;
+    state.coreClient.subscribe(() => {
+      for (const userId of state.sellers.keys()) renderSeller(userId);
+      updateStatusLine();
+    });
+
+    if (state.domBridgeTimer) clearInterval(state.domBridgeTimer);
+    state.domBridgeTimer = setInterval(() => {
+      requestDomBridge("core.getSnapshot")
+        .then((result) => {
+          if (!result?.ok || !result?.data) return;
+          state.domBridgeSnapshot = result.data;
+          state.coreClient = createCoreClient();
+          state.coreMode = state.coreClient.mode;
+          for (const userId of state.sellers.keys()) renderSeller(userId);
+          updateStatusLine();
+        })
+        .catch(() => {});
+    }, 1500);
+  }
+
   function init() {
     if (isTornBazaarPage()) {
       loadBazaarSessionState();
@@ -1064,6 +1063,7 @@
     }
 
     buildPanel();
+    setupCoreSubscription();
     scanPage();
     setupObserver();
     startLoop();
