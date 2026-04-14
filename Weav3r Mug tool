@@ -5,7 +5,10 @@
 // @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links.
 // @match        https://weav3r.dev/item/*
 // @match        https://www.torn.com/bazaar.php*
+// @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @connect      api.torn.com
+// @connect      ffscouter.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -16,6 +19,8 @@
   const DEFAULTS = {
     enabled: true,
     useCoreBackend: true,
+    tornApiKey: "",
+    ffApiKey: "",
     enableBazaarTracking: true,
     bazaarScanMs: 1000,
     bazaarAutoRefresh: true,
@@ -656,9 +661,9 @@
     const visible = state.sellers.size;
     const queuedTorn = state.pendingTorn.size;
     const queuedFF = state.pendingFF.size;
-    const coreState = state.coreAvailable ? "online" : "offline";
+    const coreState = currentBackendLabel();
     line.textContent =
-      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Core: ${coreState} | Threshold: ${state.cfg.statThresholdText}`;
+      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Backend: ${coreState} | Threshold: ${state.cfg.statThresholdText}`;
   }
 
   function canUseCoreBackend() {
@@ -667,6 +672,12 @@
       window.TornCore &&
       typeof window.TornCore.request === "function"
     );
+  }
+
+  function currentBackendLabel() {
+    if (state.coreAvailable) return "core";
+    if (state.cfg.ffApiKey && state.cfg.tornApiKey) return "legacy";
+    return "offline";
   }
 
   function syncCachesFromCoreUser(userId) {
@@ -702,8 +713,94 @@
     return out;
   }
 
+  function gmGet(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        timeout: 20000,
+        onload: (resp) => {
+          if (resp.status >= 200 && resp.status < 300) {
+            resolve(resp);
+          } else {
+            reject(new Error(`HTTP ${resp.status}: ${resp.responseText || "request failed"}`));
+          }
+        },
+        onerror: (err) => reject(err),
+        ontimeout: () => reject(new Error("Request timed out")),
+      });
+    });
+  }
+
+  async function fetchFFBatchLegacy(userIds) {
+    if (!state.cfg.ffApiKey || !userIds.length) return;
+    const url =
+      `https://ffscouter.com/api/v1/get-stats?key=${encodeURIComponent(state.cfg.ffApiKey)}&targets=${encodeURIComponent(userIds.join(","))}`;
+
+    const resp = await gmGet(url);
+    const data = JSON.parse(resp.responseText);
+    if (!Array.isArray(data)) return;
+
+    const seen = new Set();
+    for (const item of data) {
+      if (!item || !item.player_id) continue;
+      seen.add(Number(item.player_id));
+      state.ffCache.set(Number(item.player_id), {
+        bs_estimate: Number.isFinite(item.bs_estimate) ? item.bs_estimate : null,
+        bs_estimate_human: item.bs_estimate_human || null,
+        fair_fight: Number.isFinite(item.fair_fight) ? item.fair_fight : null,
+        raw: item,
+        ts: now(),
+      });
+      renderSeller(Number(item.player_id));
+    }
+
+    for (const userId of userIds) {
+      if (seen.has(userId)) continue;
+      state.ffCache.set(userId, {
+        bs_estimate: null,
+        bs_estimate_human: null,
+        fair_fight: null,
+        raw: null,
+        ts: now(),
+      });
+      renderSeller(userId);
+    }
+  }
+
+  async function fetchTornStatusLegacy(userId) {
+    if (!state.cfg.tornApiKey || !userId) return;
+    const url =
+      `https://api.torn.com/user/${userId}?selections=profile&key=${encodeURIComponent(state.cfg.tornApiKey)}`;
+    const resp = await gmGet(url);
+    const data = JSON.parse(resp.responseText);
+    if (data?.error) return;
+    const status = String(
+      data?.status?.description ||
+      data?.status?.details ||
+      data?.status?.state ||
+      data?.status ||
+      ""
+    ).trim();
+    state.tornCache.set(userId, {
+      status,
+      raw: data,
+      ts: now(),
+    });
+    renderSeller(userId);
+  }
+
   async function fetchFFBatch(userIds) {
-    if (!userIds.length || !canUseCoreBackend()) return;
+    if (!userIds.length) return;
+    if (!canUseCoreBackend()) {
+      try {
+        await fetchFFBatchLegacy(userIds);
+      } catch (err) {
+        log("Legacy FF batch error:", err);
+        userIds.forEach((userId) => state.pendingFF.add(userId));
+      }
+      return;
+    }
     try {
       const result = await window.TornCore.request("user.refresh.ff.batch", { userIds });
       if (!result?.ok) {
@@ -723,7 +820,16 @@
   }
 
   async function fetchTornBatch(userIds) {
-    if (!userIds.length || !canUseCoreBackend()) return;
+    if (!userIds.length) return;
+    if (!canUseCoreBackend()) {
+      try {
+        await Promise.allSettled(userIds.map(fetchTornStatusLegacy));
+      } catch (err) {
+        log("Legacy Torn batch error:", err);
+        userIds.forEach((userId) => state.pendingTorn.add(userId));
+      }
+      return;
+    }
     try {
       const result = await window.TornCore.request("user.refresh.torn.batch", {
         userIds,
@@ -749,10 +855,6 @@
     state.coreAvailable = canUseCoreBackend();
 
     scanPage();
-    if (!state.coreAvailable) {
-      updateStatusLine();
-      return;
-    }
 
     const batchSize = Math.max(1, Number(state.cfg.batchSize) || 10);
 
@@ -793,7 +895,17 @@
         <span id="wmh-collapse-indicator">▾</span>
       </div>
       <div class="wmh-body">
-        <div class="wmh-statusline">Backend: Torn Core broker (shared cache + batch requests)</div>
+        <div class="wmh-statusline">Backend: Torn Core preferred (legacy API fallback supported)</div>
+
+        <div class="wmh-row">
+          <label for="wmh-torn-key">Torn API key (fallback)</label>
+          <input id="wmh-torn-key" type="password" placeholder="Needed when Torn Core is unavailable">
+        </div>
+
+        <div class="wmh-row">
+          <label for="wmh-ff-key">FF Scouter API key (fallback)</label>
+          <input id="wmh-ff-key" type="password" placeholder="Needed when Torn Core is unavailable">
+        </div>
 
         <div class="wmh-row">
           <label for="wmh-threshold">Max estimated stats</label>
@@ -826,17 +938,23 @@
     `;
     document.body.appendChild(panel);
 
+    const tornKey = panel.querySelector("#wmh-torn-key");
+    const ffKey = panel.querySelector("#wmh-ff-key");
     const threshold = panel.querySelector("#wmh-threshold");
     const batch = panel.querySelector("#wmh-batch");
     const tick = panel.querySelector("#wmh-tick");
     const enabled = panel.querySelector("#wmh-enabled");
 
+    tornKey.value = state.cfg.tornApiKey || "";
+    ffKey.value = state.cfg.ffApiKey || "";
     threshold.value = state.cfg.statThresholdText || "";
     batch.value = String(state.cfg.batchSize || 10);
     tick.value = String(state.cfg.tickMs || 8000);
     enabled.checked = !!state.cfg.enabled;
 
     panel.querySelector("#wmh-save").addEventListener("click", () => {
+      state.cfg.tornApiKey = tornKey.value.trim();
+      state.cfg.ffApiKey = ffKey.value.trim();
       state.cfg.statThresholdText = threshold.value.trim();
       state.cfg.batchSize = Math.max(1, Number(batch.value) || 10);
       state.cfg.tickMs = Math.max(1000, Number(tick.value) || 8000);
