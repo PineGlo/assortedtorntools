@@ -1973,11 +1973,9 @@
             }
         }, Math.max(500, Number(state.cfg.leaderHeartbeatMs) || 1500));
 
-        state.loops.ui = setInterval(() => {
-            const activeId = document.activeElement?.id || '';
-            if (activeId === 'tc-torn-key' || activeId === 'tc-ff-key') return;
-            renderPanel();
-        }, 1000);
+        // Removed periodic panel rerender loop to avoid clobbering key input fields.
+        // Panel updates are driven by domTick/publishCore and explicit actions.
+        state.loops.ui = null;
 
         state.loops.bridge = setInterval(() => {
             processBridgeRequests();
