@@ -430,6 +430,11 @@
             getUser(userId) {
                 return state.core.users.byId[String(userId)] || null;
             },
+            getUsersByIds(userIds = []) {
+                return (userIds || [])
+                    .map(userId => state.core.users.byId[String(userId)] || null)
+                    .filter(Boolean);
+            },
             getFreshUser(userId, opts = {}) {
                 const user = state.core.users.byId[String(userId)] || null;
                 if (!user) return null;
@@ -452,6 +457,17 @@
             },
             requestVisibleUsersTornRefresh(opts = {}) {
                 return requestBroker('users.visible.refresh.torn', opts || {});
+            },
+            requestUsersFFRefresh(userIds = []) {
+                return requestBroker('user.refresh.ff.batch', {
+                    userIds: Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite))),
+                });
+            },
+            requestUsersTornRefresh(userIds = [], opts = {}) {
+                return requestBroker('user.refresh.torn.batch', {
+                    ...(opts || {}),
+                    userIds: Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite))),
+                });
             },
             subscribe(callback) {
                 if (typeof callback !== 'function') return () => {};
