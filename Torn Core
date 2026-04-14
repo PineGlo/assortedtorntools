@@ -1,9 +1,10 @@
 // ==UserScript==
-// @name         Torn Core v2 Scaffold
+// @name         Torn Core v2 Rebuild + Alliance Protection
 // @namespace    pineglow.torn.core
-// @version      2.0.0
-// @description  Shared Torn runtime core: page adapters, DOM state, visible-user cache, API broker scaffold, and request bus.
+// @version      2.2.0
+// @description  Shared Torn runtime core for Torn + Weav3r. Provides cached user truth, Torn API refresh, FFScouter API refresh, leader tab brokering, and alliance/protected-member caching.
 // @match        https://www.torn.com/*
+// @match        https://weav3r.dev/item/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
@@ -14,1827 +15,2183 @@
 // ==/UserScript==
 
 (function () {
-    'use strict';
+  "use strict";
 
-    const CORE_NAME = 'torn_core_v2';
-    const CHANNEL_NAME = 'torn_core_v2_channel';
-    const EVENT_NAME = 'torn_core_v2_update';
+  const CHANNEL_NAME = "torn_core_v2_channel";
+  const EVENT_NAME = "torn_core_v2_update";
 
-    const STORAGE_KEYS = {
-        settings: 'torn_core_v2_settings',
-        leader: 'torn_core_v2_leader',
-        snapshot: 'torn_core_v2_snapshot',
-        panelCollapsed: 'torn_core_v2_panel_collapsed',
-        panelX: 'torn_core_v2_panel_x',
-        panelY: 'torn_core_v2_panel_y',
-        tabId: 'torn_core_v2_tab_id',
-    };
+  const BRIDGE_KEYS = {
+    snapshot: "torn_core_v2_bridge_snapshot",
+    requests: "torn_core_v2_bridge_requests",
+    responses: "torn_core_v2_bridge_responses",
+  };
 
-    const DEFAULTS = {
-        enabled: true,
-        domPollFastMs: 250,
-        domPollMediumMs: 1000,
-        domPollSlowMs: 2000,
-        leaderHeartbeatMs: 1500,
-        leaderStaleMs: 5000,
-        heartbeatPublishMs: 5000,
+  const STORAGE_KEYS = {
+    settings: "torn_core_v2_settings",
+    leader: "torn_core_v2_leader",
+    snapshot: "torn_core_v2_snapshot",
+    panelCollapsed: "torn_core_v2_panel_collapsed",
+    panelX: "torn_core_v2_panel_x",
+    panelY: "torn_core_v2_panel_y",
+    tabId: "torn_core_v2_tab_id",
+  };
 
-        tornApiKey: '',
-        ffApiKey: '',
+  const DEFAULT_PROTECTED_FACTIONS = [
+    { id: 48635, name: "Combat Ready Rockstars" },
+    { id: 2738088, name: "CR-ACK" },
+    { id: 51679, name: "CRashpad" },
+    { id: 51064, name: "Combat Ready Massacre" },
+    { id: 44445, name: "Combat Ready HQ" },
+  ];
 
-        tornBatchTtlMs: 60 * 1000,
-        ffBatchTtlMs: 3 * 24 * 60 * 60 * 1000,
-        visibleUserStaleMs: 120 * 1000,
-        attackTruthTtlMs: 60 * 1000,
-        profileTruthTtlMs: 5 * 60 * 1000,
+  const DEFAULTS = {
+    enabled: true,
+    showPanel: true,
+    debug: false,
 
-        debug: false,
-        showPanel: true,
-    };
+    domPollFastMs: 500,
+    domPollMediumMs: 1500,
+    domPollSlowMs: 3000,
 
-    const SOURCE_PRIORITY = {
-        unknown: 0,
-        dom_visible: 1,
-        profile_dom: 2,
-        ff_visible_dom: 2,
-        ff_cache_db: 3,
-        torn_batch_api: 3,
-        ff_batch_api: 4,
-        attack_loader: 5,
-    };
+    leaderHeartbeatMs: 1500,
+    leaderStaleMs: 5000,
+    heartbeatPublishMs: 5000,
 
-    const state = {
-        tabId: getOrCreateTabId(),
-        bc: typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(CHANNEL_NAME) : null,
-        cfg: loadSettings(),
-        isLeader: false,
+    tornApiKey: "",
+    ffApiKey: "",
 
-        loops: {
-            dom: null,
-            leader: null,
-            ui: null,
+    tornBatchTtlMs: 60 * 1000,
+    ffBatchTtlMs: 3 * 24 * 60 * 60 * 1000,
+    visibleUserStaleMs: 120 * 1000,
+    attackTruthTtlMs: 60 * 1000,
+    profileTruthTtlMs: 5 * 60 * 1000,
+
+    ffMaxBatchSize: 50,
+    tornMaxBatchSize: 15,
+
+    allianceProtectionEnabled: true,
+    allianceHighlightBlue: true,
+    allianceSkipPollingProtected: true,
+    allianceRefreshMs: 3 * 24 * 60 * 60 * 1000,
+    protectedFactionsText: DEFAULT_PROTECTED_FACTIONS.map((f) => `${f.id}|${f.name}`).join("\n"),
+  };
+
+  const SOURCE_PRIORITY = {
+    unknown: 0,
+    dom_visible: 1,
+    profile_dom: 2,
+    ff_cache_db: 3,
+    torn_batch_api: 3,
+    ff_batch_api: 4,
+    attack_loader: 5,
+    protected_members_api: 6,
+  };
+
+  const state = {
+    tabId: getOrCreateTabId(),
+    bc: typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(CHANNEL_NAME) : null,
+    cfg: loadSettings(),
+    isLeader: false,
+
+    loops: {
+      dom: null,
+      leader: null,
+      bridge: null,
+      protection: null,
+    },
+
+    brokerSeq: 0,
+    brokerPending: {},
+
+    panel: null,
+
+    version: 0,
+    lastPublishedJson: "",
+    lastPublishedAt: 0,
+
+    prev: {
+      href: location.href,
+      path: location.pathname,
+      hash: location.hash,
+      lifeCurrent: null,
+      cashOnHand: null,
+    },
+
+    core: {
+      ts: 0,
+      schemaVersion: 2,
+      coreVersion: "2.2.0",
+      leaderTabId: null,
+
+      dom: {
+        ts: 0,
+        domVersion: 0,
+        url: {
+          href: location.href,
+          path: location.pathname,
+          hash: location.hash,
+          changed: false,
+          pathChanged: false,
+          hashChanged: false,
         },
-        brokerSeq: 0,
-        brokerPending: {},
-
-        panel: null,
-        panelBody: null,
-        dragging: null,
-
-        version: 0,
-        lastPublishedJson: '',
-        lastPublishedAt: 0,
-
-        prev: {
-            href: location.href,
-            path: location.pathname,
-            hash: location.hash,
-            lifeCurrent: null,
-            cashOnHand: null,
-            vaultCash: null,
+        page: {
+          type: "other",
+          isPropertiesPage: false,
+          isVaultPage: false,
+          isAttackPage: false,
+          isTradePage: false,
+          isBazaarPage: false,
+          isFactionPage: false,
+          isProfilePage: false,
         },
+        life: {
+          current: null,
+          max: null,
+          pct: null,
+          delta: null,
+          drop: 0,
+          rise: 0,
+          changed: false,
+          source: "",
+        },
+        cash: {
+          onHand: null,
+          delta: null,
+          increase: 0,
+          changed: false,
+          source: "",
+        },
+        hospital: {
+          hasGlobalHospitalIcon: false,
+          label: "",
+        },
+        combat: {
+          attackDetected: false,
+          onAttackPage: false,
+          targetHospitalDialog: "",
+          targetReleaseEtaText: "",
+          targetUserId: null,
+        },
+      },
 
-        core: {
-            ts: 0,
-            schemaVersion: 2,
-            coreVersion: '2.0.0',
-            leaderTabId: null,
+      users: {
+        byId: {},
+      },
 
-            dom: {
-                ts: 0,
-                domVersion: 0,
+      api: {
+        cache: {
+          torn: {},
+          ff: {},
+        },
+        inFlight: {},
+        status: {
+          tornApiKeyConfigured: false,
+          ffApiKeyConfigured: false,
+          tornLastSuccessAt: 0,
+          ffLastSuccessAt: 0,
+          tornLastError: "",
+          ffLastError: "",
+          updatedAt: 0,
+          ffRateLimitLimit: null,
+          ffRateLimitRemaining: null,
+          ffRateLimitResetAt: null,
+        },
+        stats: {
+          lastBatchTornAt: 0,
+          lastBatchFFAt: 0,
+        },
+      },
 
-                url: {
-                    href: location.href,
-                    path: location.pathname,
-                    hash: location.hash,
-                    changed: false,
-                    pathChanged: false,
-                    hashChanged: false,
-                },
+      protectedMembers: {
+        byUserId: {},
+        factionIds: [],
+        lastRefreshAt: 0,
+        lastError: "",
+      },
 
-                page: {
-                    type: 'other',
-                    isPropertiesPage: false,
-                    isVaultPage: false,
-                    isAttackPage: false,
-                    isTradePage: false,
-                    isBazaarPage: false,
-                    isFactionPage: false,
-                    isProfilePage: false,
-                },
+      requests: {
+        pending: [],
+      },
+    },
+  };
 
-                life: {
-                    current: null,
-                    max: null,
-                    pct: null,
-                    delta: null,
-                    drop: 0,
-                    rise: 0,
-                    changed: false,
-                    source: '',
-                },
+  function getOrCreateTabId() {
+    const existing = sessionStorage.getItem(STORAGE_KEYS.tabId);
+    if (existing) return existing;
+    const created = `core_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    sessionStorage.setItem(STORAGE_KEYS.tabId, created);
+    return created;
+  }
 
-                cash: {
-                    onHand: null,
-                    delta: null,
-                    increase: 0,
-                    changed: false,
-                    source: '',
-                },
+  function isWeav3rPage() {
+    return location.hostname === "weav3r.dev" && location.pathname.startsWith("/item/");
+  }
 
-                vault: {
-                    cash: null,
-                    delta: null,
-                    changed: false,
-                    title: '',
-                    input: {
-                        value: null,
-                        dataMoney: null,
-                        dataDeposit: null,
-                        dataMax: null,
-                    },
-                },
+  function loadSettings() {
+    const raw = GM_getValue(STORAGE_KEYS.settings, {}) || {};
+    return { ...DEFAULTS, ...raw };
+  }
 
-                actions: {
-                    hasVaultMaxButton: false,
-                    hasVaultDepositButton: false,
-                    hasFactionDepositButton: false,
-                    hasFactionDepositConfirmYes: false,
-                },
+  function saveSettings() {
+    GM_setValue(STORAGE_KEYS.settings, state.cfg);
+  }
 
-                trade: {
-                    hasTradeTab: false,
-                    hasTradeTextbox: false,
-                    hasTradeSendButton: false,
-                },
+  function log(...args) {
+    if (state.cfg.debug) console.log("[TORN CORE]", ...args);
+  }
 
-                hospital: {
-                    hasGlobalHospitalIcon: false,
-                    label: '',
-                },
+  function now() {
+    return Date.now();
+  }
 
-                combat: {
-                    attackDetected: false,
-                    onAttackPage: false,
-                    targetHospitalDialog: '',
-                    targetReleaseEtaText: '',
-                    targetUserId: null,
-                },
-            },
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
 
-            users: {
-                byId: {},
-            },
+  function safeJsonParse(text, fallback = null) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return fallback;
+    }
+  }
 
-            api: {
-                cache: {
-                    torn: {},
-                    ff: {},
-                },
-                inFlight: {},
-                stats: {
-                    lastBatchTornAt: 0,
-                    lastBatchFFAt: 0,
-                }
-            },
+  function normalizeText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
 
-            requests: {
-                pending: [],
-            }
-        }
+  function toNumber(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function parseMoney(text) {
+    if (!text) return null;
+    const cleaned = String(text).replace(/[^0-9.-]/g, "");
+    if (!cleaned) return null;
+    const n = Number(cleaned.replace(/,/g, ""));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function parseUser2IdFromHref(href) {
+    if (!href) return null;
+    const m = String(href).match(/[?&]user2ID=(\d+)/i);
+    return m ? Number(m[1]) : null;
+  }
+
+  function parseXidFromHref(href) {
+    if (!href) return null;
+    const m = String(href).match(/[?&]XID=(\d+)/i);
+    return m ? Number(m[1]) : null;
+  }
+
+  function parseUserIdFromHref(href) {
+    if (!href) return null;
+    const m = String(href).match(/[?&]userId=(\d+)/i);
+    return m ? Number(m[1]) : null;
+  }
+
+  function normalizeStatusText(text) {
+    const s = normalizeText(text).toLowerCase();
+    if (!s) return "";
+    if (s === "okay") return "Okay";
+    if (s.includes("hospital")) return "Hospital";
+    if (s.includes("traveling") || s.includes("returning to torn")) return "Traveling";
+    if (s.includes("abroad")) return "Traveling";
+    return normalizeText(text);
+  }
+
+  function toEpochMs(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n < 1e12 ? n * 1000 : n;
+  }
+
+  function fmtAgo(ts) {
+    if (!ts) return "-";
+    const ms = now() - Number(ts);
+    if (ms < 1000) return "just now";
+    if (ms < 60 * 1000) return `${Math.floor(ms / 1000)}s ago`;
+    if (ms < 60 * 60 * 1000) return `${Math.floor(ms / 60000)}m ago`;
+    if (ms < 24 * 60 * 60 * 1000) return `${Math.floor(ms / 3600000)}h ago`;
+    return `${Math.floor(ms / 86400000)}d ago`;
+  }
+
+  function sourceRank(source) {
+    return SOURCE_PRIORITY[String(source || "").trim()] || 0;
+  }
+
+  function shouldTakePatch(existingSource, patchSource, existingAt = 0, patchAt = 0) {
+    const existingRank = sourceRank(existingSource);
+    const patchRank = sourceRank(patchSource);
+    if (patchRank > existingRank) return true;
+    if (patchRank < existingRank) return false;
+    return Number(patchAt || 0) >= Number(existingAt || 0);
+  }
+
+  function parseProtectedFactionsText(text) {
+    const lines = String(text || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const out = [];
+    const seen = new Set();
+
+    for (const line of lines) {
+      const parts = line.split("|");
+      const id = Number(parts[0]?.trim());
+      const name = normalizeText(parts.slice(1).join("|"));
+      if (!Number.isFinite(id) || seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        name: name || `Faction ${id}`,
+      });
+    }
+
+    return out;
+  }
+
+  function ensureCoreShape() {
+    if (!state.core.api) state.core.api = {};
+    if (!state.core.api.cache) state.core.api.cache = { torn: {}, ff: {} };
+    if (!state.core.api.inFlight) state.core.api.inFlight = {};
+    if (!state.core.api.stats) state.core.api.stats = { lastBatchTornAt: 0, lastBatchFFAt: 0 };
+    if (!state.core.api.status) {
+      state.core.api.status = {
+        tornApiKeyConfigured: false,
+        ffApiKeyConfigured: false,
+        tornLastSuccessAt: 0,
+        ffLastSuccessAt: 0,
+        tornLastError: "",
+        ffLastError: "",
+        updatedAt: 0,
+        ffRateLimitLimit: null,
+        ffRateLimitRemaining: null,
+        ffRateLimitResetAt: null,
+      };
+    }
+    if (!state.core.protectedMembers) {
+      state.core.protectedMembers = {
+        byUserId: {},
+        factionIds: [],
+        lastRefreshAt: 0,
+        lastError: "",
+      };
+    }
+  }
+
+  function makeEmptyUserRecord(userId) {
+    return {
+      userId: Number(userId),
+      name: "",
+      links: {
+        profile: Number.isFinite(Number(userId)) ? `https://www.torn.com/profiles.php?XID=${Number(userId)}` : "",
+        attack: Number.isFinite(Number(userId)) ? `https://www.torn.com/loader.php?sid=attack&user2ID=${Number(userId)}` : "",
+        bazaar: Number.isFinite(Number(userId)) ? `https://www.torn.com/bazaar.php?userId=${Number(userId)}` : "",
+      },
+      dom: {
+        statusText: "",
+        statusClass: "",
+        hospitalText: "",
+        travelText: "",
+        travelDestination: "",
+        lastSeenAt: 0,
+        source: "",
+      },
+      torn: {
+        status: "",
+        hospitalUntil: null,
+        hospitalEtaText: "",
+        lastRefreshAt: 0,
+        source: "",
+      },
+      ff: {
+        fairFight: null,
+        estimatedStats: null,
+        estimatedStatsHuman: "",
+        distributionHuman: "",
+        distributionLastUpdated: null,
+        ffLastUpdated: null,
+        lastRefreshAt: 0,
+        source: "",
+      },
+      group: {
+        factionId: null,
+        factionName: "",
+        isProtected: false,
+        protectedLastRefreshAt: 0,
+        source: "",
+      },
+      seen: {
+        lastSeenAt: 0,
+        isStale: false,
+        attackTruthStale: true,
+        profileTruthStale: true,
+      },
+    };
+  }
+
+  function ensureUserRecord(userId, patch = {}) {
+    const id = Number(userId);
+    if (!Number.isFinite(id)) return null;
+
+    const key = String(id);
+    const existing = state.core.users.byId[key] || makeEmptyUserRecord(id);
+    const merged = JSON.parse(JSON.stringify(existing));
+
+    if (patch.name) merged.name = normalizeText(patch.name);
+
+    merged.links = {
+      ...merged.links,
+      ...(patch.links || {}),
     };
 
-    function getOrCreateTabId() {
-        const existing = sessionStorage.getItem(STORAGE_KEYS.tabId);
-        if (existing) return existing;
-        const created = `core_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-        sessionStorage.setItem(STORAGE_KEYS.tabId, created);
-        return created;
-    }
-
-    function loadSettings() {
-        const raw = GM_getValue(STORAGE_KEYS.settings, {}) || {};
-        return {
-            ...DEFAULTS,
-            ...raw,
+    if (patch.dom) {
+      const domPatch = patch.dom;
+      const domPatchAt = Number(domPatch.lastSeenAt || now());
+      if (shouldTakePatch(merged.dom.source, domPatch.source, merged.dom.lastSeenAt, domPatchAt)) {
+        merged.dom = {
+          ...merged.dom,
+          ...domPatch,
+          statusText: normalizeText(domPatch.statusText || merged.dom.statusText),
+          hospitalText: normalizeText(domPatch.hospitalText || merged.dom.hospitalText),
+          travelText: normalizeText(domPatch.travelText || merged.dom.travelText),
+          travelDestination: normalizeText(domPatch.travelDestination || merged.dom.travelDestination),
+          lastSeenAt: domPatchAt,
+          source: domPatch.source || merged.dom.source,
         };
+      }
     }
 
-    function saveSettings() {
-        GM_setValue(STORAGE_KEYS.settings, state.cfg);
-    }
-
-    function log(...args) {
-        if (state.cfg.debug) {
-            console.log('[TORN CORE]', ...args);
-        }
-    }
-
-    function now() {
-        return Date.now();
-    }
-
-    function clamp(n, min, max) {
-        return Math.max(min, Math.min(max, n));
-    }
-
-    function safeJsonParse(text, fallback = null) {
-        try {
-            return JSON.parse(text);
-        } catch {
-            return fallback;
-        }
-    }
-
-    function normalizeText(text) {
-        return String(text || '').replace(/\s+/g, ' ').trim();
-    }
-
-    function toNumber(v) {
-        const n = Number(v);
-        return Number.isFinite(n) ? n : null;
-    }
-
-    function parseMoney(text) {
-        if (!text) return null;
-        const cleaned = String(text).replace(/[^0-9.-]/g, '');
-        if (!cleaned) return null;
-        const n = Number(cleaned.replace(/,/g, ''));
-        return Number.isFinite(n) ? n : null;
-    }
-
-    function parseXidFromHref(href) {
-        if (!href) return null;
-        const m = String(href).match(/[?&]XID=(\d+)/i);
-        return m ? Number(m[1]) : null;
-    }
-
-    function parseUser2IdFromHref(href) {
-        if (!href) return null;
-        const m = String(href).match(/[?&]user2ID=(\d+)/i);
-        return m ? Number(m[1]) : null;
-    }
-
-    function normalizeStatusText(text) {
-        const s = normalizeText(text).toLowerCase();
-        if (!s) return '';
-        if (s === 'okay') return 'Okay';
-        if (s.includes('hospital')) return 'Hospital';
-        if (s.includes('traveling') || s.includes('returning to torn')) return 'Traveling';
-        return '';
-    }
-
-    function parseTravelDestination(text) {
-        const normalized = normalizeText(text);
-        if (!normalized) return '';
-        const toMatch = normalized.match(/traveling to\s+(.+)$/i);
-        if (toMatch) return normalizeText(toMatch[1]);
-        const returnMatch = normalized.match(/returning to\s+(.+)$/i);
-        if (returnMatch) return normalizeText(returnMatch[1]);
-        return '';
-    }
-
-    function parseHospitalEtaText(text) {
-        const normalized = normalizeText(text);
-        if (!normalized) return '';
-        const eta = normalized.match(/Release ETA:\s*(.+?)\.?$/i);
-        if (eta) return normalizeText(eta[1]);
-        const fallback = normalized.match(/(\d+\s*h)?\s*(\d+\s*m)?\s*(\d+\s*s)?/i);
-        return fallback ? normalizeText(fallback[0]) : '';
-    }
-
-    function toEpochMs(value) {
-        const n = Number(value);
-        if (!Number.isFinite(n) || n <= 0) return null;
-        return n < 1e12 ? n * 1000 : n;
-    }
-
-    function fmtMoney(v) {
-        return Number.isFinite(v) ? `$${Math.round(v).toLocaleString()}` : '-';
-    }
-
-    function fmtPct(v, digits = 1) {
-        return Number.isFinite(v) ? `${v.toFixed(digits)}%` : '-';
-    }
-
-    function getLeaderRecord() {
-        return GM_getValue(STORAGE_KEYS.leader, null);
-    }
-
-    function setLeaderRecord() {
-        GM_setValue(STORAGE_KEYS.leader, {
-            tabId: state.tabId,
-            heartbeatAt: now(),
-        });
-    }
-
-    function clearLeaderRecord() {
-        const rec = getLeaderRecord();
-        if (rec && rec.tabId === state.tabId) {
-            GM_setValue(STORAGE_KEYS.leader, null);
-        }
-    }
-
-    function maybeBecomeLeader() {
-        const rec = getLeaderRecord();
-        const t = now();
-
-        if (!rec || !rec.tabId || (t - Number(rec.heartbeatAt || 0)) > state.cfg.leaderStaleMs) {
-            state.isLeader = true;
-            state.core.leaderTabId = state.tabId;
-            setLeaderRecord();
-            return;
-        }
-
-        state.isLeader = rec.tabId === state.tabId;
-        state.core.leaderTabId = rec.tabId || null;
-    }
-
-    function heartbeatLeader() {
-        if (!state.isLeader) return;
-        setLeaderRecord();
-        broadcast({
-            type: 'leader-heartbeat',
-            leaderTabId: state.tabId,
-        });
-    }
-
-    function broadcast(payload) {
-        try {
-            if (state.bc) {
-                state.bc.postMessage({
-                    sender: state.tabId,
-                    at: now(),
-                    ...payload,
-                });
-            }
-        } catch (_) {}
-    }
-
-    function setupBroadcastChannel() {
-        if (!state.bc) return;
-        state.bc.onmessage = (event) => {
-            const msg = event.data || {};
-            if (msg.sender === state.tabId) return;
-
-            if (msg.type === 'leader-heartbeat') {
-                state.core.leaderTabId = msg.leaderTabId || state.core.leaderTabId;
-                return;
-            }
-
-            if (msg.type === 'core-update' && msg.snapshot && !state.isLeader) {
-                applySnapshot(msg.snapshot);
-                renderPanel();
-                exposeWindowApi();
-                return;
-            }
-
-            if (msg.type === 'request-broker' && state.isLeader) {
-                handleBrokerMessage(msg);
-                return;
-            }
-
-            if (msg.type === 'broker-response') {
-                handleBrokerResponse(msg);
-                return;
-            }
+    if (patch.torn) {
+      const tornPatch = patch.torn;
+      const tornPatchAt = Number(tornPatch.lastRefreshAt || now());
+      if (shouldTakePatch(merged.torn.source, tornPatch.source, merged.torn.lastRefreshAt, tornPatchAt)) {
+        merged.torn = {
+          ...merged.torn,
+          ...tornPatch,
+          status: normalizeStatusText(tornPatch.status || merged.torn.status),
+          lastRefreshAt: tornPatchAt,
+          source: tornPatch.source || merged.torn.source,
         };
+      }
     }
 
-    function exposeWindowApi() {
-        window.__TORN_CORE_STATE__ = state.core;
-
-        window.TornCore = {
-            getState() {
-                return state.core;
-            },
-            getDomState() {
-                return state.core.dom;
-            },
-            getUsers() {
-                return state.core.users;
-            },
-            getUser(userId) {
-                return state.core.users.byId[String(userId)] || null;
-            },
-            subscribe(callback) {
-                if (typeof callback !== 'function') return () => {};
-                const handler = (event) => callback(event.detail);
-                window.addEventListener(EVENT_NAME, handler);
-                return () => window.removeEventListener(EVENT_NAME, handler);
-            },
-            request(type, payload = {}) {
-                return requestBroker(type, payload);
-            },
+    if (patch.ff) {
+      const ffPatch = patch.ff;
+      const ffPatchAt = Number(ffPatch.lastRefreshAt || now());
+      if (shouldTakePatch(merged.ff.source, ffPatch.source, merged.ff.lastRefreshAt, ffPatchAt)) {
+        merged.ff = {
+          ...merged.ff,
+          ...ffPatch,
+          lastRefreshAt: ffPatchAt,
+          source: ffPatch.source || merged.ff.source,
         };
+      }
     }
 
-    function dispatchWindowUpdate() {
-        try {
-            window.dispatchEvent(new CustomEvent(EVENT_NAME, {
-                detail: state.core,
-            }));
-        } catch (_) {}
+    if (patch.group) {
+      const groupPatch = patch.group;
+      const patchAt = Number(groupPatch.protectedLastRefreshAt || now());
+      if (shouldTakePatch(merged.group.source, groupPatch.source, merged.group.protectedLastRefreshAt, patchAt)) {
+        merged.group = {
+          ...merged.group,
+          ...groupPatch,
+          protectedLastRefreshAt: patchAt,
+          source: groupPatch.source || merged.group.source,
+        };
+      }
     }
 
-    function snapshotCore() {
-        return JSON.parse(JSON.stringify(state.core));
+    const seenAt = Math.max(
+      Number(merged.dom.lastSeenAt || 0),
+      Number(merged.torn.lastRefreshAt || 0),
+      Number(merged.ff.lastRefreshAt || 0),
+      Number(patch.seen?.lastSeenAt || 0),
+    );
+
+    merged.seen = {
+      ...merged.seen,
+      ...(patch.seen || {}),
+      lastSeenAt: seenAt,
+      isStale: false,
+      attackTruthStale: !(
+        merged.torn?.source === "attack_loader" &&
+        Number(merged.torn?.lastRefreshAt || 0) >= (now() - state.cfg.attackTruthTtlMs)
+      ),
+      profileTruthStale: !(
+        merged.torn?.source === "profile_dom" &&
+        Number(merged.torn?.lastRefreshAt || 0) >= (now() - state.cfg.profileTruthTtlMs)
+      ),
+    };
+
+    state.core.users.byId[key] = merged;
+    return merged;
+  }
+
+  function getLeaderRecord() {
+    return GM_getValue(STORAGE_KEYS.leader, null);
+  }
+
+  function setLeaderRecord() {
+    GM_setValue(STORAGE_KEYS.leader, {
+      tabId: state.tabId,
+      heartbeatAt: now(),
+    });
+  }
+
+  function maybeBecomeLeader() {
+    const rec = getLeaderRecord();
+    const t = now();
+    if (!rec || !rec.tabId || (t - Number(rec.heartbeatAt || 0)) > state.cfg.leaderStaleMs) {
+      state.isLeader = true;
+      state.core.leaderTabId = state.tabId;
+      setLeaderRecord();
+      return;
     }
+    state.isLeader = rec.tabId === state.tabId;
+    state.core.leaderTabId = rec.tabId || null;
+  }
 
-    function applySnapshot(snapshot) {
-        if (!snapshot || typeof snapshot !== 'object') return;
-        state.core = snapshot;
-    }
+  function heartbeatLeader() {
+    if (!state.isLeader) return;
+    setLeaderRecord();
+    broadcast({
+      type: "leader-heartbeat",
+      leaderTabId: state.tabId,
+    });
+  }
 
-    function persistSnapshot(snapshot) {
-        try {
-            localStorage.setItem(STORAGE_KEYS.snapshot, JSON.stringify(snapshot));
-        } catch (_) {}
-    }
-
-    function loadSnapshot() {
-        const raw = localStorage.getItem(STORAGE_KEYS.snapshot);
-        return safeJsonParse(raw, null);
-    }
-
-    function publishCore(force = false) {
-        const snapshot = snapshotCore();
-        const json = JSON.stringify(snapshot);
-        const heartbeatDue = (now() - state.lastPublishedAt) >= state.cfg.heartbeatPublishMs;
-
-        if (!force && json === state.lastPublishedJson && !heartbeatDue) {
-            return false;
-        }
-
-        state.lastPublishedJson = json;
-        state.lastPublishedAt = now();
-
-        persistSnapshot(snapshot);
-        broadcast({
-            type: 'core-update',
-            snapshot,
+  function broadcast(payload) {
+    try {
+      if (state.bc) {
+        state.bc.postMessage({
+          sender: state.tabId,
+          at: now(),
+          ...payload,
         });
+      }
+    } catch {}
+  }
 
-        exposeWindowApi();
-        dispatchWindowUpdate();
+  function setupBroadcastChannel() {
+    if (!state.bc) return;
+    state.bc.onmessage = (event) => {
+      const msg = event.data || {};
+      if (msg.sender === state.tabId) return;
+
+      if (msg.type === "leader-heartbeat") {
+        state.core.leaderTabId = msg.leaderTabId || state.core.leaderTabId;
+        return;
+      }
+
+      if (msg.type === "core-update" && msg.snapshot && !state.isLeader) {
+        applySnapshot(msg.snapshot);
         renderPanel();
-        return true;
-    }
+        exposeWindowApi();
+        return;
+      }
 
-    function requestBroker(type, payload = {}) {
-        const requestId = `req_${Date.now()}_${++state.brokerSeq}_${Math.random().toString(36).slice(2, 8)}`;
-        const req = {
-            id: requestId,
-            type,
-            payload,
-            requesterTabId: state.tabId,
-            requestedAt: now(),
-        };
+      if (msg.type === "request-broker" && state.isLeader) {
+        handleBrokerMessage(msg);
+        return;
+      }
 
-        if (state.isLeader) {
-            return handleBrokerRequest(req);
+      if (msg.type === "broker-response") {
+        handleBrokerResponse(msg);
+      }
+    };
+  }
+
+  function exposeWindowApi() {
+    window.__TORN_CORE_STATE__ = state.core;
+    window.TornCore = {
+      getState() {
+        return state.core;
+      },
+      getDomState() {
+        return state.core.dom;
+      },
+      getUsers() {
+        return state.core.users;
+      },
+      getUser(userId) {
+        return state.core.users.byId[String(userId)] || null;
+      },
+      getProtectedMembers() {
+        return state.core.protectedMembers || { byUserId: {} };
+      },
+      async getFreshUser(userId, opts = {}) {
+        const id = Number(userId);
+        if (!Number.isFinite(id)) return null;
+        if (opts.ff) {
+          await requestBroker("user.refresh.ff.batch", { userIds: [id], forceFresh: !!opts.forceFresh });
         }
+        if (opts.torn !== false) {
+          await requestBroker("user.refresh.torn.batch", {
+            userIds: [id],
+            forceFresh: !!opts.forceFresh,
+            forceSingleApi: !!opts.forceSingleApi,
+          });
+        }
+        return state.core.users.byId[String(id)] || null;
+      },
+      requestUsersFFRefresh(userIds = [], opts = {}) {
+        return requestBroker("user.refresh.ff.batch", { userIds, ...opts });
+      },
+      requestUsersTornRefresh(userIds = [], opts = {}) {
+        return requestBroker("user.refresh.torn.batch", { userIds, ...opts });
+      },
+      refreshProtectedMembers() {
+        return requestBroker("protection.refresh", {});
+      },
+      subscribe(callback) {
+        if (typeof callback !== "function") return () => {};
+        const handler = (event) => callback(event.detail);
+        window.addEventListener(EVENT_NAME, handler);
+        return () => window.removeEventListener(EVENT_NAME, handler);
+      },
+      request(type, payload = {}) {
+        return requestBroker(type, payload);
+      },
+    };
+  }
 
+  function dispatchWindowUpdate() {
+    try {
+      window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: state.core }));
+    } catch {}
+  }
+
+  function snapshotCore() {
+    return JSON.parse(JSON.stringify(state.core));
+  }
+
+  function applySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return;
+    state.core = snapshot;
+    ensureCoreShape();
+  }
+
+  function persistSnapshot(snapshot) {
+    try {
+      localStorage.setItem(STORAGE_KEYS.snapshot, JSON.stringify(snapshot));
+    } catch {}
+  }
+
+  function loadSnapshot() {
+    const raw = localStorage.getItem(STORAGE_KEYS.snapshot);
+    return safeJsonParse(raw, null);
+  }
+
+  function publishBridgeSnapshot(snapshot) {
+    try {
+      GM_setValue(BRIDGE_KEYS.snapshot, {
+        ts: Number(snapshot?.ts || now()),
+        leaderTabId: snapshot?.leaderTabId || null,
+        dom: snapshot?.dom || null,
+        users: snapshot?.users || { byId: {} },
+        protectedMembers: snapshot?.protectedMembers || { byUserId: {} },
+        api: {
+          stats: snapshot?.api?.stats || {},
+          status: snapshot?.api?.status || {},
+        },
+      });
+    } catch (err) {
+      log("Failed to publish bridge snapshot", err);
+    }
+  }
+
+  function publishCore(force = false) {
+    ensureCoreShape();
+    const snapshot = snapshotCore();
+    const json = JSON.stringify(snapshot);
+    const heartbeatDue = (now() - state.lastPublishedAt) >= state.cfg.heartbeatPublishMs;
+
+    if (!force && json === state.lastPublishedJson && !heartbeatDue) return false;
+
+    state.lastPublishedJson = json;
+    state.lastPublishedAt = now();
+
+    persistSnapshot(snapshot);
+    publishBridgeSnapshot(snapshot);
+    broadcast({ type: "core-update", snapshot });
+
+    exposeWindowApi();
+    dispatchWindowUpdate();
+    renderPanel();
+    return true;
+  }
+
+  function appendBridgeResponse(item) {
+    try {
+      const raw = GM_getValue(BRIDGE_KEYS.responses, []);
+      const responses = Array.isArray(raw) ? raw : [];
+      responses.push(item);
+      GM_setValue(BRIDGE_KEYS.responses, responses.slice(-200));
+    } catch (err) {
+      log("Failed to append bridge response", err);
+    }
+  }
+
+  function processBridgeRequests() {
+    if (!state.isLeader) return;
+
+    const rawRequests = GM_getValue(BRIDGE_KEYS.requests, []);
+    const requests = Array.isArray(rawRequests) ? rawRequests : [];
+    if (!requests.length) return;
+
+    const rawResponses = GM_getValue(BRIDGE_KEYS.responses, []);
+    const responses = Array.isArray(rawResponses) ? rawResponses : [];
+    const responded = new Set(responses.map((r) => r?.requestId).filter(Boolean));
+
+    requests.forEach((req) => {
+      if (!req?.id || responded.has(req.id)) return;
+      Promise.resolve(handleBrokerRequest({
+        id: req.id,
+        type: req.type,
+        payload: req.payload || {},
+        requesterTabId: req.requester || "bridge",
+        requestedAt: Number(req.createdAt) || now(),
+      }))
+        .then((result) => appendBridgeResponse({ requestId: req.id, at: now(), result }))
+        .catch((err) => appendBridgeResponse({
+          requestId: req.id,
+          at: now(),
+          result: { ok: false, error: String(err?.message || err || "Bridge broker execution failed") },
+        }));
+    });
+
+    if (requests.length > 200) {
+      GM_setValue(BRIDGE_KEYS.requests, requests.slice(-200));
+    }
+  }
+
+  function handleBrokerMessage(msg) {
+    const req = msg.request;
+    if (!req) return;
+
+    Promise.resolve(handleBrokerRequest(req))
+      .then((result) => {
+        if (!req.requesterTabId || req.requesterTabId === state.tabId) return;
         broadcast({
-            type: 'request-broker',
-            request: req,
+          type: "broker-response",
+          requestId: req.id,
+          requesterTabId: req.requesterTabId,
+          result,
         });
-
-        return new Promise((resolve) => {
-            const timeoutMs = 7000;
-            const timeout = setTimeout(() => {
-                delete state.brokerPending[requestId];
-                resolve({
-                    ok: false,
-                    brokered: true,
-                    timeout: true,
-                    message: 'Broker response timed out waiting for leader.',
-                    request: req,
-                });
-            }, timeoutMs);
-
-            state.brokerPending[requestId] = { resolve, timeout };
+      })
+      .catch((err) => {
+        if (!req.requesterTabId || req.requesterTabId === state.tabId) return;
+        broadcast({
+          type: "broker-response",
+          requestId: req.id,
+          requesterTabId: req.requesterTabId,
+          result: { ok: false, error: String(err?.message || err || "Broker execution failed") },
         });
-    }
+      });
+  }
 
-    function handleBrokerMessage(msg) {
-        const req = msg.request;
-        if (!req) return;
-        Promise.resolve(handleBrokerRequest(req))
-            .then((result) => {
-                if (!req.requesterTabId || req.requesterTabId === state.tabId) return;
-                broadcast({
-                    type: 'broker-response',
-                    requestId: req.id,
-                    requesterTabId: req.requesterTabId,
-                    result,
-                });
-            })
-            .catch((err) => {
-                if (!req.requesterTabId || req.requesterTabId === state.tabId) return;
-                broadcast({
-                    type: 'broker-response',
-                    requestId: req.id,
-                    requesterTabId: req.requesterTabId,
-                    result: {
-                        ok: false,
-                        error: String(err?.message || err || 'Broker execution failed'),
-                    }
-                });
-            });
-    }
+  function handleBrokerResponse(msg) {
+    if (!msg || msg.requesterTabId !== state.tabId) return;
+    const pending = state.brokerPending[msg.requestId];
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    delete state.brokerPending[msg.requestId];
+    pending.resolve(msg.result || { ok: false, error: "Empty broker response" });
+  }
 
-    function handleBrokerResponse(msg) {
-        if (!msg || msg.requesterTabId !== state.tabId) return;
-        const pending = state.brokerPending[msg.requestId];
-        if (!pending) return;
-        clearTimeout(pending.timeout);
-        delete state.brokerPending[msg.requestId];
-        pending.resolve(msg.result || { ok: false, error: 'Empty broker response' });
-    }
+  function requestBroker(type, payload = {}) {
+    const requestId = `req_${Date.now()}_${++state.brokerSeq}_${Math.random().toString(36).slice(2, 8)}`;
+    const req = {
+      id: requestId,
+      type,
+      payload,
+      requesterTabId: state.tabId,
+      requestedAt: now(),
+    };
 
-    function makeCacheKey(type, payload) {
-        return `${type}:${JSON.stringify(payload || {})}`;
-    }
+    if (state.isLeader) return handleBrokerRequest(req);
 
-    function isFresh(entry, ttlMs) {
-        return !!entry && (now() - Number(entry.ts || 0)) < ttlMs;
-    }
+    broadcast({ type: "request-broker", request: req });
 
-    function openIndexedDb(dbName) {
-        return new Promise((resolve, reject) => {
-            try {
-                const req = indexedDB.open(dbName);
-                req.onerror = () => reject(req.error || new Error(`Failed to open DB ${dbName}`));
-                req.onsuccess = () => resolve(req.result);
-            } catch (err) {
-                reject(err);
-            }
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        delete state.brokerPending[requestId];
+        resolve({
+          ok: false,
+          brokered: true,
+          timeout: true,
+          message: "Broker response timed out waiting for leader.",
+          request: req,
         });
-    }
+      }, 7000);
 
-    function readAllRows(db, storeName) {
-        return new Promise((resolve, reject) => {
-            try {
-                const tx = db.transaction(storeName, 'readonly');
-                const store = tx.objectStore(storeName);
-                const req = store.getAll();
-                req.onerror = () => reject(req.error || new Error('getAll failed'));
-                req.onsuccess = () => resolve(req.result || []);
-            } catch (err) {
-                reject(err);
-            }
-        });
-    }
+      state.brokerPending[requestId] = { resolve, timeout };
+    });
+  }
 
-    async function loadFFRowsByUserIds(userIds) {
-        const wanted = new Set((userIds || []).map(Number).filter(Number.isFinite));
-        if (!wanted.size) return {};
+  function makeCacheKey(type, payload) {
+    return `${type}:${JSON.stringify(payload || {})}`;
+  }
 
-        let db = null;
-        try {
-            db = await openIndexedDb('ffscouter-cache');
-            const rows = await readAllRows(db, 'cache');
-            const out = {};
+  function isFresh(entry, ttlMs) {
+    return !!entry && (now() - Number(entry.ts || 0)) < ttlMs;
+  }
 
-            for (const row of rows) {
-                const id = Number(row?.player_id);
-                if (!Number.isFinite(id) || !wanted.has(id)) continue;
-                out[String(id)] = row;
-            }
-            return out;
-        } catch (err) {
-            log('FF cache read failed', err);
-            return {};
-        } finally {
-            try { db?.close(); } catch (_) {}
-        }
-    }
+  function refreshApiStatus() {
+    ensureCoreShape();
+    state.core.api.status.tornApiKeyConfigured = !!String(state.cfg.tornApiKey || "").trim();
+    state.core.api.status.ffApiKeyConfigured = !!String(state.cfg.ffApiKey || "").trim();
+    state.core.api.status.updatedAt = now();
+  }
 
-    function requestTornProfileApi(userId, forceFresh = false) {
-        return new Promise((resolve) => {
-            const key = String(state.cfg.tornApiKey || '').trim();
-            if (!key) {
-                resolve({ ok: false, userId, error: 'Missing Torn API key in Torn Core settings.' });
-                return;
-            }
+  function requestTornProfileApi(userId, forceFresh = false) {
+    return new Promise((resolve) => {
+      const key = String(state.cfg.tornApiKey || "").trim();
+      if (!key) {
+        resolve({ ok: false, userId, error: "Missing Torn API key in Torn Core settings." });
+        return;
+      }
 
-            let url = `https://api.torn.com/user/${Number(userId)}?selections=profile&key=${encodeURIComponent(key)}&comment=torn_core_batch`;
-            if (forceFresh) {
-                url += `&timestamp=${Date.now()}`;
+      let url = `https://api.torn.com/user/${Number(userId)}?selections=profile&key=${encodeURIComponent(key)}&comment=torn_core_batch`;
+      if (forceFresh) url += `&timestamp=${Date.now()}`;
+
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        onload: (response) => {
+          try {
+            const data = JSON.parse(response.responseText || "{}");
+            if (data.error) {
+              resolve({
+                ok: false,
+                userId,
+                error: data.error.error || "API error",
+                errorCode: Number(data.error.code) || null,
+              });
+              return;
             }
 
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url,
-                onload: (response) => {
-                    try {
-                        const data = JSON.parse(response.responseText || '{}');
-                        if (data.error) {
-                            resolve({
-                                ok: false,
-                                userId,
-                                error: data.error.error || 'API error',
-                                errorCode: Number(data.error.code) || null,
-                            });
-                            return;
-                        }
-
-                        const status = data.status || {};
-                        const statusText = normalizeStatusText(status.state || status.description || '');
-                        const hospitalUntil = toEpochMs(status.until);
-                        resolve({
-                            ok: true,
-                            userId,
-                            status: statusText,
-                            hospitalUntil,
-                            hospitalEtaText: '',
-                            fetchedAt: now(),
-                        });
-                    } catch (err) {
-                        resolve({ ok: false, userId, error: 'Parse error' });
-                    }
-                },
-                onerror: () => resolve({ ok: false, userId, error: 'Network error' }),
-                ontimeout: () => resolve({ ok: false, userId, error: 'Timeout' }),
-            });
-        });
-    }
-
-    function handleBrokerRequest(req) {
-        const { type, payload } = req;
-        const cacheKey = makeCacheKey(type, payload);
-
-        switch (type) {
-            case 'dom.state':
-                return Promise.resolve({
-                    ok: true,
-                    source: 'dom',
-                    data: state.core.dom,
-                });
-
-            case 'users.visible':
-                return Promise.resolve({
-                    ok: true,
-                    source: 'cache',
-                    data: state.core.users,
-                });
-
-            case 'user.visible':
-                return Promise.resolve({
-                    ok: true,
-                    source: 'cache',
-                    data: state.core.users.byId[String(payload.userId)] || null,
-                });
-
-            case 'user.refresh.ff.batch':
-                return brokerFFBatch(payload.userIds || [], cacheKey);
-
-            case 'user.refresh.torn.batch':
-                return brokerTornBatch(payload.userIds || [], cacheKey, payload);
-
-            case 'user.refresh.attackLoader':
-                {
-                    const userId = Number(payload.userId);
-                    const cachedUser = Number.isFinite(userId) ? (state.core.users.byId[String(userId)] || null) : null;
-                    const hasRecentAttackTruth =
-                        !!cachedUser &&
-                        cachedUser.torn?.source === 'attack_loader' &&
-                        (now() - Number(cachedUser.torn?.lastRefreshAt || 0)) <= state.cfg.attackTruthTtlMs;
-
-                    return Promise.resolve({
-                        ok: true,
-                        source: 'attack_loader_recommendation',
-                        data: {
-                            userId: Number.isFinite(userId) ? userId : null,
-                            recommendedUrl: `/page.php?sid=attack&user2ID=${Number(payload.userId) || 0}`,
-                            cachedUser,
-                            hasRecentAttackTruth,
-                            preferredSingleRefreshPath: 'attack_loader',
-                        }
-                    });
-                }
-
-            default:
-                return Promise.resolve({
-                    ok: false,
-                    error: `Unknown broker request type: ${type}`,
-                });
-        }
-    }
-
-    function brokerFFBatch(userIds, cacheKey) {
-        const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
-        const cached = state.core.api.cache.ff[cacheKey];
-
-        if (isFresh(cached, state.cfg.ffBatchTtlMs)) {
-            return Promise.resolve({
-                ok: true,
-                source: 'cache',
-                data: cached.data,
-            });
-        }
-
-        if (state.core.api.inFlight[cacheKey]) {
-            return state.core.api.inFlight[cacheKey];
-        }
-
-        const promise = new Promise(async (resolve) => {
-            const ffRows = await loadFFRowsByUserIds(uniqueIds);
-            const mergedUsers = [];
-
-            for (const id of uniqueIds) {
-                const row = ffRows[String(id)];
-                if (!row) continue;
-
-                ensureUserRecord(id, {
-                    ff: {
-                        estimatedStats: row.bs_estimate ?? null,
-                        estimatedStatsHuman: row.bs_estimate_human || '',
-                        visibleFairFight: row.ff_visible || '',
-                        visibleEstimatedStats: row.ff_estimate_visible || '',
-                        lastRefreshAt: now(),
-                        source: 'ff_batch_api',
-                    }
-                });
-                mergedUsers.push(id);
-            }
-
-            const data = {
-                userIds: uniqueIds,
-                mergedUserIds: mergedUsers,
-                found: mergedUsers.length,
-                missing: uniqueIds.length - mergedUsers.length,
-                status: 'ok',
-            };
-
-            state.core.api.cache.ff[cacheKey] = {
-                ts: now(),
-                data,
-            };
-            state.core.api.stats.lastBatchFFAt = now();
-            delete state.core.api.inFlight[cacheKey];
-            publishCore(true);
+            const status = data.status || {};
+            const statusText = normalizeStatusText(status.state || status.description || "");
+            const hospitalUntil = toEpochMs(status.until);
 
             resolve({
-                ok: true,
-                source: 'ff_batch_api',
-                data,
+              ok: true,
+              userId,
+              status: statusText,
+              hospitalUntil,
+              hospitalEtaText: "",
+              fetchedAt: now(),
             });
-        });
+          } catch {
+            resolve({ ok: false, userId, error: "Parse error" });
+          }
+        },
+        onerror: () => resolve({ ok: false, userId, error: "Network error" }),
+        ontimeout: () => resolve({ ok: false, userId, error: "Timeout" }),
+      });
+    });
+  }
 
-        state.core.api.inFlight[cacheKey] = promise;
-        return promise;
-    }
+  function parseResponseHeaders(headerText) {
+    const out = {};
+    String(headerText || "")
+      .split(/\r?\n/)
+      .forEach((line) => {
+        const idx = line.indexOf(":");
+        if (idx <= 0) return;
+        const key = line.slice(0, idx).trim().toLowerCase();
+        const value = line.slice(idx + 1).trim();
+        if (key) out[key] = value;
+      });
+    return out;
+  }
 
-    function brokerTornBatch(userIds, cacheKey, payload = {}) {
-        const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
-        if (!uniqueIds.length) {
-            return Promise.resolve({
-                ok: true,
-                source: 'policy',
-                data: { userIds: [], results: {}, usedApi: false }
-            });
-        }
+  function requestFFBatchApi(userIds, forceFresh = false) {
+    return new Promise((resolve) => {
+      const key = String(state.cfg.ffApiKey || "").trim();
+      if (!key) {
+        resolve({ ok: false, error: "Missing FF Scouter API key in Torn Core settings.", rows: [] });
+        return;
+      }
 
-        if (uniqueIds.length === 1 && !payload.forceSingleApi) {
-            const singleUserId = uniqueIds[0];
-            const cachedUser = state.core.users.byId[String(singleUserId)] || null;
-            return Promise.resolve({
-                ok: true,
-                source: 'policy',
-                data: {
-                    userIds: uniqueIds,
-                    usedApi: false,
-                    reason: 'Single-user refresh prefers attack loader/profile/visible DOM before API.',
-                    recommendation: `/page.php?sid=attack&user2ID=${singleUserId}`,
-                    cachedUser,
-                }
-            });
-        }
+      const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
+      if (!uniqueIds.length) {
+        resolve({ ok: true, rows: [], rateHeaders: {} });
+        return;
+      }
 
-        const cached = state.core.api.cache.torn[cacheKey];
+      const maxBatch = clamp(Number(state.cfg.ffMaxBatchSize) || 50, 1, 100);
+      const ids = uniqueIds.slice(0, maxBatch);
+      let url = `https://ffscouter.com/api/v1/get-stats?key=${encodeURIComponent(key)}&targets=${ids.join(",")}`;
+      if (forceFresh) url += `&timestamp=${Date.now()}`;
 
-        if (isFresh(cached, state.cfg.tornBatchTtlMs)) {
-            return Promise.resolve({
-                ok: true,
-                source: 'cache',
-                data: cached.data,
-            });
-        }
-
-        if (state.core.api.inFlight[cacheKey]) {
-            return state.core.api.inFlight[cacheKey];
-        }
-
-        const promise = new Promise(async (resolve) => {
-            const key = String(state.cfg.tornApiKey || '').trim();
-            if (!key) {
-                const fallbackResults = {};
-                for (const id of uniqueIds) {
-                    const cachedUser = state.core.users.byId[String(id)] || null;
-                    fallbackResults[String(id)] = {
-                        ok: false,
-                        usedApi: false,
-                        reason: 'missing_core_api_key',
-                        cachedUser,
-                    };
-                }
-                const noKeyData = {
-                    userIds: uniqueIds,
-                    usedApi: false,
-                    source: 'policy',
-                    reason: 'Missing Torn Core API key.',
-                    results: fallbackResults,
-                };
-                delete state.core.api.inFlight[cacheKey];
-                resolve({ ok: false, source: 'policy', data: noKeyData });
-                return;
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        onload: (response) => {
+          try {
+            if (!response) {
+              resolve({ ok: false, error: "Empty FF response.", rows: [] });
+              return;
             }
 
-            const results = {};
-            for (const id of uniqueIds) {
-                const apiResult = await requestTornProfileApi(id, !!payload.forceFresh);
-                if (apiResult.ok) {
-                    ensureUserRecord(id, {
-                        torn: {
-                            status: apiResult.status || '',
-                            hospitalUntil: apiResult.hospitalUntil || 0,
-                            hospitalEtaText: apiResult.hospitalEtaText || '',
-                            lastRefreshAt: apiResult.fetchedAt || now(),
-                            source: 'torn_batch_api',
-                        }
-                    });
-                }
-
-                const merged = state.core.users.byId[String(id)] || null;
-                results[String(id)] = {
-                    ok: !!apiResult.ok,
-                    error: apiResult.error || null,
-                    errorCode: apiResult.errorCode || null,
-                    usedApi: true,
-                    torn: merged?.torn || null,
-                };
+            if (response.status !== 200) {
+              let err = `FF API request failed with status ${response.status}`;
+              try {
+                const parsed = JSON.parse(response.responseText || "{}");
+                if (parsed?.error) err = `${parsed.error}${parsed.code ? ` (code ${parsed.code})` : ""}`;
+              } catch {}
+              resolve({ ok: false, error: err, rows: [] });
+              return;
             }
 
-            const data = {
-                userIds: uniqueIds,
-                usedApi: true,
-                source: 'torn_batch_api',
-                refreshedAt: now(),
-                results,
-            };
+            const parsed = JSON.parse(response.responseText || "[]");
+            if (parsed?.error) {
+              resolve({ ok: false, error: parsed.error, rows: [] });
+              return;
+            }
 
-            state.core.api.cache.torn[cacheKey] = {
-                ts: now(),
-                data,
-            };
-            state.core.api.stats.lastBatchTornAt = now();
-            delete state.core.api.inFlight[cacheKey];
-            publishCore(true);
+            const threeDays = 3 * 24 * 60 * 60 * 1000;
+            const expiry = now() + threeDays;
+            const rows = Array.isArray(parsed) ? parsed.map((result) => {
+              if (!result || !result.player_id) return null;
+
+              if (result.fair_fight === null) {
+                return {
+                  player_id: Number(result.player_id),
+                  no_data: true,
+                  expiry,
+                };
+              }
+
+              return {
+                player_id: Number(result.player_id),
+                value: Number(result.fair_fight),
+                last_updated: result.last_updated || null,
+                expiry,
+                bs_estimate: Number.isFinite(Number(result.bs_estimate)) ? Number(result.bs_estimate) : null,
+                bs_estimate_human: result.bs_estimate_human || "",
+                distribution_human: result.distribution?.distribution_human ?? "",
+                distribution_last_updated: result.distribution?.last_updated ?? null,
+              };
+            }).filter(Boolean) : [];
 
             resolve({
-                ok: true,
-                source: 'torn_batch_api',
-                data,
+              ok: true,
+              rows,
+              rateHeaders: parseResponseHeaders(response.responseHeaders || ""),
             });
-        });
+          } catch {
+            resolve({ ok: false, error: "FF API parse error.", rows: [] });
+          }
+        },
+        onerror: () => resolve({ ok: false, error: "FF API network error.", rows: [] }),
+        ontimeout: () => resolve({ ok: false, error: "FF API timeout.", rows: [] }),
+      });
+    });
+  }
 
-        state.core.api.inFlight[cacheKey] = promise;
-        return promise;
-    }
+  function requestFactionMembersApi(factionId) {
+    return new Promise((resolve) => {
+      const key = String(state.cfg.tornApiKey || "").trim();
+      if (!key) {
+        resolve({ ok: false, factionId, error: "Missing Torn API key in Torn Core settings." });
+        return;
+      }
 
-    function parseLifeBox() {
-        const lifeRegions = Array.from(document.querySelectorAll('[role="region"]')).slice(0, 20);
+      const url = `https://api.torn.com/v2/faction/${Number(factionId)}/members?striptags=true&key=${encodeURIComponent(key)}`;
 
-        for (const region of lifeRegions) {
-            const txt = normalizeText(region.innerText || region.textContent || '');
-            if (!txt.includes('Life')) continue;
-
-            const valueEl = region.querySelector('p[class*="bar-value"]');
-            const valueTxt = normalizeText(valueEl?.innerText || valueEl?.textContent || '');
-            const m = valueTxt.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
-
-            if (m) {
-                const current = Number(m[1].replace(/,/g, ''));
-                const max = Number(m[2].replace(/,/g, ''));
-                if (Number.isFinite(current) && Number.isFinite(max) && max > 0) {
-                    return {
-                        current,
-                        max,
-                        source: 'life-region',
-                    };
-                }
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        onload: (response) => {
+          try {
+            const data = JSON.parse(response.responseText || "{}");
+            if (data?.error) {
+              resolve({
+                ok: false,
+                factionId,
+                error: data.error.error || "Faction members API error",
+                errorCode: Number(data.error.code) || null,
+              });
+              return;
             }
-        }
 
-        const fallbackEls = Array.from(document.querySelectorAll('p[class*="bar-value"]')).slice(0, 20);
-        for (const el of fallbackEls) {
-            const parentTxt = normalizeText(el.parentElement?.innerText || '');
-            if (!parentTxt.includes('Life')) continue;
+            const members = data?.members || data || {};
+            resolve({
+              ok: true,
+              factionId,
+              members,
+            });
+          } catch {
+            resolve({ ok: false, factionId, error: "Faction members parse error" });
+          }
+        },
+        onerror: () => resolve({ ok: false, factionId, error: "Faction members network error" }),
+        ontimeout: () => resolve({ ok: false, factionId, error: "Faction members timeout" }),
+      });
+    });
+  }
 
-            const txt = normalizeText(el.innerText || el.textContent || '');
-            const m = txt.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
-            if (m) {
-                const current = Number(m[1].replace(/,/g, ''));
-                const max = Number(m[2].replace(/,/g, ''));
-                if (Number.isFinite(current) && Number.isFinite(max) && max > 0) {
-                    return {
-                        current,
-                        max,
-                        source: 'life-value-fallback',
-                    };
-                }
-            }
-        }
+  function openIndexedDb(dbName) {
+    return new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open(dbName, 1);
 
-        return {
-            current: null,
-            max: null,
-            source: '',
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains("cache")) {
+            const store = db.createObjectStore("cache", { keyPath: "player_id" });
+            store.createIndex("expiry", ["expiry"], { unique: false });
+          }
         };
+
+        req.onerror = () => reject(req.error || new Error(`Failed to open DB ${dbName}`));
+        req.onsuccess = () => resolve(req.result);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  function readAllRows(db, storeName) {
+    return new Promise((resolve, reject) => {
+      try {
+        const tx = db.transaction(storeName, "readonly");
+        const store = tx.objectStore(storeName);
+        const req = store.getAll();
+        req.onerror = () => reject(req.error || new Error("getAll failed"));
+        req.onsuccess = () => resolve(req.result || []);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async function loadFFRowsByUserIds(userIds) {
+    const wanted = new Set((userIds || []).map(Number).filter(Number.isFinite));
+    if (!wanted.size) return {};
+
+    let db = null;
+    try {
+      db = await openIndexedDb("ffscouter-cache");
+      const rows = await readAllRows(db, "cache");
+      const out = {};
+
+      for (const row of rows) {
+        const id = Number(row?.player_id);
+        if (!Number.isFinite(id) || !wanted.has(id)) continue;
+        if (Number(row?.expiry || 0) > now()) out[String(id)] = row;
+      }
+      return out;
+    } catch (err) {
+      log("FF cache read failed", err);
+      return {};
+    } finally {
+      try { db?.close(); } catch {}
+    }
+  }
+
+  async function writeFFRowsToCache(rows) {
+    if (!Array.isArray(rows) || !rows.length) return false;
+
+    let db = null;
+    try {
+      db = await openIndexedDb("ffscouter-cache");
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("cache", "readwrite");
+        const store = tx.objectStore("cache");
+        tx.onerror = () => reject(tx.error || new Error("cache write failed"));
+        tx.oncomplete = () => resolve();
+
+        rows.forEach((row) => store.put(row));
+      });
+      return true;
+    } catch (err) {
+      log("FF cache write failed", err);
+      return false;
+    } finally {
+      try { db?.close(); } catch {}
+    }
+  }
+
+  async function brokerFFBatch(userIds, cacheKey, payload = {}) {
+    const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
+    if (!uniqueIds.length) {
+      return { ok: true, source: "policy", data: { userIds: [], mergedUserIds: [], found: 0, missing: 0, status: "ok" } };
     }
 
-    function parseCashBox() {
-        const el = document.querySelector('#user-money');
-        if (el) {
-            const dataMoney = toNumber(el.getAttribute('data-money'));
-            const txtValue = parseMoney(el.innerText || el.textContent || '');
-            return {
-                onHand: dataMoney ?? txtValue,
-                source: '#user-money',
-            };
-        }
-
-        return {
-            onHand: null,
-            source: '',
-        };
+    const cached = state.core.api.cache.ff[cacheKey];
+    if (!payload.forceFresh && isFresh(cached, state.cfg.ffBatchTtlMs)) {
+      return { ok: true, source: "cache", data: cached.data };
     }
 
-    function parseVaultSection() {
-        const titleEl = Array.from(document.querySelectorAll('.title-black, .title, h4, p'))
-            .find(el => normalizeText(el.innerText || el.textContent || '').toLowerCase().includes('vault'));
+    if (state.core.api.inFlight[cacheKey]) return state.core.api.inFlight[cacheKey];
 
-        const vaultCashEl = document.querySelector('#vault-wvalue');
-        const inputEl = document.querySelector('input.input-money, input.amount.input-money');
-        const maxBtn = Array.from(document.querySelectorAll('input.wai-btn'))
-            .find(el => (el.getAttribute('aria-label') || '').toLowerCase().includes('maximum amount'));
-        const depositBtn = Array.from(document.querySelectorAll('input.torn-btn, button.torn-btn'))
-            .find(el => normalizeText(el.value || el.innerText || el.textContent || '').toUpperCase() === 'DEPOSIT');
+    const promise = new Promise(async (resolve) => {
+      const direct = await requestFFBatchApi(uniqueIds, !!payload.forceFresh);
 
-        const factionDepositBtn = Array.from(document.querySelectorAll('button.torn-btn'))
-            .find(el => normalizeText(el.innerText || el.textContent || '').toUpperCase() === 'DEPOSIT MONEY');
+      if (direct.ok) {
+        const mergedUsers = [];
+        for (const row of direct.rows) {
+          const id = Number(row.player_id);
+          if (!Number.isFinite(id)) continue;
 
-        const factionConfirmYes = document.querySelector('a.yes[aria-label="Yes, I want to deposit"]');
-
-        return {
-            title: normalizeText(titleEl?.innerText || titleEl?.textContent || ''),
-            cash: parseMoney(vaultCashEl?.innerText || vaultCashEl?.textContent || ''),
-            input: {
-                value: inputEl ? (inputEl.value || null) : null,
-                dataMoney: inputEl ? toNumber(inputEl.getAttribute('data-money')) : null,
-                dataDeposit: inputEl ? toNumber(inputEl.getAttribute('data-deposit')) : null,
-                dataMax: inputEl ? toNumber(inputEl.getAttribute('data-max')) : null,
-            },
-            actions: {
-                hasVaultMaxButton: !!maxBtn,
-                hasVaultDepositButton: !!depositBtn,
-                hasFactionDepositButton: !!factionDepositBtn,
-                hasFactionDepositConfirmYes: !!factionConfirmYes,
-            }
-        };
-    }
-
-    function parseTradeSection() {
-        const tradeTab =
-            document.querySelector('#channel_panel_button\\:public_trade') ||
-            Array.from(document.querySelectorAll('button[title]')).find(el => normalizeText(el.getAttribute('title')).toLowerCase() === 'trade');
-
-        const tradeTextbox =
-            document.querySelector('textarea[placeholder="Type your message here..."]') ||
-            document.querySelector('textarea');
-
-        const sendButton = tradeTextbox?.parentElement?.querySelector('button') || null;
-
-        return {
-            hasTradeTab: !!tradeTab,
-            hasTradeTextbox: !!tradeTextbox,
-            hasTradeSendButton: !!sendButton,
-        };
-    }
-
-    function parseHospitalGlobal() {
-        const icon = document.querySelector('a[aria-label^="Hospital:"]');
-        return {
-            hasGlobalHospitalIcon: !!icon,
-            label: icon?.getAttribute('aria-label') || '',
-        };
-    }
-
-    function getPageType() {
-        const href = location.href.toLowerCase();
-        const path = location.pathname.toLowerCase();
-        const bodyText = normalizeText(document.body?.innerText || '');
-
-        const hasVaultTitle = bodyText.toLowerCase().includes('extra large vault');
-        const hasPropertiesTitle = normalizeText(document.querySelector('#skip-to-content')?.innerText || '').toLowerCase() === 'all properties';
-        const hasAttackTitle = normalizeText(document.querySelector('h4')?.innerText || '').toLowerCase() === 'attacking';
-
-        if (href.includes('sid=attack') || hasAttackTitle) return 'attack';
-        if (hasVaultTitle || (path.includes('/properties.php') && bodyText.toLowerCase().includes('stored in the vault'))) return 'vault';
-        if (hasPropertiesTitle || path.includes('/properties.php')) return 'properties';
-        if (path.includes('/factions.php')) return 'faction';
-        if (path.includes('/profiles.php')) return 'profile';
-        if (path.includes('/bazaar.php')) return 'bazaar';
-        if (path.includes('/trade.php')) return 'trade';
-        return 'other';
-    }
-
-    function parseAttackPage() {
-        const title = Array.from(document.querySelectorAll('h4')).find(el => normalizeText(el.innerText || el.textContent || '').toLowerCase() === 'attacking');
-        const dialog = Array.from(document.querySelectorAll('div')).find(el => {
-            const txt = normalizeText(el.innerText || el.textContent || '');
-            return txt.includes('currently in hospital and cannot be attacked') || txt.includes('Release ETA:');
-        });
-
-        const dialogText = normalizeText(dialog?.innerText || dialog?.textContent || '');
-        const etaMatch = dialogText.match(/Release ETA:\s*(.+?)\.?$/i);
-        const targetUserId = parseUser2IdFromHref(location.href);
-
-        return {
-            onAttackPage: !!title || location.href.toLowerCase().includes('sid=attack'),
-            targetHospitalDialog: dialogText || '',
-            targetReleaseEtaText: etaMatch ? etaMatch[1].trim() : '',
-            targetUserId: Number.isFinite(targetUserId) ? targetUserId : null,
-        };
-    }
-
-    function updateDomState() {
-        const t = now();
-        const pageType = getPageType();
-
-        const life = parseLifeBox();
-        const cash = parseCashBox();
-        const vault = parseVaultSection();
-        const trade = parseTradeSection();
-        const hospital = parseHospitalGlobal();
-        const combat = parseAttackPage();
-
-        const prevLife = state.prev.lifeCurrent;
-        const prevCash = state.prev.cashOnHand;
-        const prevVault = state.prev.vaultCash;
-
-        const lifeDelta = (Number.isFinite(life.current) && Number.isFinite(prevLife)) ? life.current - prevLife : null;
-        const lifeDrop = (Number.isFinite(lifeDelta) && lifeDelta < 0) ? Math.abs(lifeDelta) : 0;
-        const lifeRise = (Number.isFinite(lifeDelta) && lifeDelta > 0) ? lifeDelta : 0;
-
-        const cashDelta = (Number.isFinite(cash.onHand) && Number.isFinite(prevCash)) ? cash.onHand - prevCash : null;
-        const cashIncrease = (Number.isFinite(cashDelta) && cashDelta > 0) ? cashDelta : 0;
-
-        const vaultDelta = (Number.isFinite(vault.cash) && Number.isFinite(prevVault)) ? vault.cash - prevVault : null;
-
-        const lifePct = (Number.isFinite(life.current) && Number.isFinite(life.max) && life.max > 0)
-            ? (life.current / life.max) * 100
-            : null;
-
-        const href = location.href;
-        const path = location.pathname;
-        const hash = location.hash;
-
-        state.core.dom.ts = t;
-        state.core.dom.domVersion = ++state.version;
-        state.core.dom.url = {
-            href,
-            path,
-            hash,
-            changed: href !== state.prev.href,
-            pathChanged: path !== state.prev.path,
-            hashChanged: hash !== state.prev.hash,
-        };
-
-        state.core.dom.page = {
-            type: pageType,
-            isPropertiesPage: pageType === 'properties' || pageType === 'vault',
-            isVaultPage: pageType === 'vault',
-            isAttackPage: pageType === 'attack',
-            isTradePage: pageType === 'trade',
-            isBazaarPage: pageType === 'bazaar',
-            isFactionPage: pageType === 'faction',
-            isProfilePage: pageType === 'profile',
-        };
-
-        state.core.dom.life = {
-            current: life.current,
-            max: life.max,
-            pct: lifePct,
-            delta: lifeDelta,
-            drop: lifeDrop,
-            rise: lifeRise,
-            changed: Number.isFinite(lifeDelta) && lifeDelta !== 0,
-            source: life.source,
-        };
-
-        state.core.dom.cash = {
-            onHand: cash.onHand,
-            delta: cashDelta,
-            increase: cashIncrease,
-            changed: Number.isFinite(cashDelta) && cashDelta !== 0,
-            source: cash.source,
-        };
-
-        state.core.dom.vault = {
-            cash: vault.cash,
-            delta: vaultDelta,
-            changed: Number.isFinite(vaultDelta) && vaultDelta !== 0,
-            title: vault.title,
-            input: vault.input,
-        };
-
-        state.core.dom.actions = vault.actions;
-        state.core.dom.trade = trade;
-        state.core.dom.hospital = hospital;
-        state.core.dom.combat = {
-            attackDetected: !!combat.onAttackPage || lifeDrop > 0,
-            onAttackPage: !!combat.onAttackPage,
-            targetHospitalDialog: combat.targetHospitalDialog,
-            targetReleaseEtaText: combat.targetReleaseEtaText,
-            targetUserId: combat.targetUserId,
-        };
-
-        state.prev.href = href;
-        state.prev.path = path;
-        state.prev.hash = hash;
-        if (Number.isFinite(life.current)) state.prev.lifeCurrent = life.current;
-        if (Number.isFinite(cash.onHand)) state.prev.cashOnHand = cash.onHand;
-        if (Number.isFinite(vault.cash)) state.prev.vaultCash = vault.cash;
-    }
-
-    function sourceRank(source) {
-        return SOURCE_PRIORITY[String(source || '').trim()] || 0;
-    }
-
-    function shouldTakePatch(existingSource, patchSource, existingAt = 0, patchAt = 0) {
-        const existingRank = sourceRank(existingSource);
-        const patchRank = sourceRank(patchSource);
-        if (patchRank > existingRank) return true;
-        if (patchRank < existingRank) return false;
-        return Number(patchAt || 0) >= Number(existingAt || 0);
-    }
-
-    function mergeTruthyText(currentValue, nextValue) {
-        const next = normalizeText(nextValue);
-        return next || currentValue || '';
-    }
-
-    function mergeUserRecord(existing, patch = {}) {
-        const merged = JSON.parse(JSON.stringify(existing));
-
-        merged.name = mergeTruthyText(merged.name, patch.name);
-        merged.links = {
-            ...merged.links,
-            ...(patch.links || {}),
-        };
-
-        if (patch.dom) {
-            const dom = patch.dom;
-            merged.dom.statusText = mergeTruthyText(merged.dom.statusText, normalizeStatusText(dom.statusText));
-            merged.dom.statusClass = mergeTruthyText(merged.dom.statusClass, dom.statusClass);
-            merged.dom.hospitalText = mergeTruthyText(merged.dom.hospitalText, dom.hospitalText);
-            merged.dom.hospitalReason = mergeTruthyText(merged.dom.hospitalReason, dom.hospitalReason);
-            merged.dom.travelText = mergeTruthyText(merged.dom.travelText, dom.travelText);
-            merged.dom.travelDestination = mergeTruthyText(merged.dom.travelDestination, dom.travelDestination || parseTravelDestination(dom.travelText));
-            merged.dom.roleText = mergeTruthyText(merged.dom.roleText, dom.roleText);
-            merged.dom.levelText = mergeTruthyText(merged.dom.levelText, dom.levelText);
-        }
-
-        if (patch.ff) {
-            const patchSource = patch.ff.source || merged.ff.source || 'unknown';
-            const patchAt = Number(patch.ff.lastRefreshAt || 0);
-            const existingAt = Number(merged.ff.lastRefreshAt || 0);
-
-            merged.ff.visibleFairFight = mergeTruthyText(merged.ff.visibleFairFight, patch.ff.visibleFairFight);
-            merged.ff.visibleEstimatedStats = mergeTruthyText(merged.ff.visibleEstimatedStats, patch.ff.visibleEstimatedStats);
-
-            const hasPatchEstimate = patch.ff.estimatedStats != null || patch.ff.estimatedStatsHuman;
-            if (hasPatchEstimate && shouldTakePatch(merged.ff.source, patchSource, existingAt, patchAt)) {
-                if (patch.ff.estimatedStats != null) merged.ff.estimatedStats = patch.ff.estimatedStats;
-                merged.ff.estimatedStatsHuman = mergeTruthyText(merged.ff.estimatedStatsHuman, patch.ff.estimatedStatsHuman);
-                merged.ff.lastRefreshAt = patchAt || now();
-                merged.ff.source = patchSource;
-            } else if (!merged.ff.source && patchSource) {
-                merged.ff.source = patchSource;
-            }
-        }
-
-        if (patch.torn) {
-            const patchSource = patch.torn.source || merged.torn.source || 'unknown';
-            const patchAt = Number(patch.torn.lastRefreshAt || 0);
-            const existingAt = Number(merged.torn.lastRefreshAt || 0);
-            const canReplace = shouldTakePatch(merged.torn.source, patchSource, existingAt, patchAt);
-
-            if (canReplace) {
-                merged.torn.status = mergeTruthyText(merged.torn.status, normalizeStatusText(patch.torn.status));
-                const nextUntil = Number(patch.torn.hospitalUntil || 0);
-                if (Number.isFinite(nextUntil) && nextUntil > 0) {
-                    merged.torn.hospitalUntil = nextUntil;
-                }
-                merged.torn.hospitalEtaText = mergeTruthyText(
-                    merged.torn.hospitalEtaText,
-                    patch.torn.hospitalEtaText || parseHospitalEtaText(patch.dom?.hospitalText)
-                );
-                merged.torn.lastRefreshAt = patchAt || now();
-                merged.torn.source = patchSource;
-            } else if (!merged.torn.source && patchSource) {
-                merged.torn.source = patchSource;
-            }
-        }
-
-        return merged;
-    }
-
-    function ensureUserRecord(userId, patch = {}) {
-        const key = String(userId);
-        const existing = state.core.users.byId[key] || {
-            userId,
-            name: '',
-            links: {
-                profile: '',
-                attack: '',
-                faction: '',
-                bazaar: '',
-            },
-            seen: {
-                firstSeenAt: now(),
-                lastSeenAt: now(),
-                lastSeenPageType: '',
-                lastSeenHref: '',
-            },
-            dom: {
-                statusText: '',
-                statusClass: '',
-                hospitalText: '',
-                hospitalReason: '',
-                travelText: '',
-                travelDestination: '',
-                roleText: '',
-                levelText: '',
-            },
-            derived: {
-                isOkay: false,
-                isHospitalized: false,
-                isTraveling: false,
-                isReturning: false,
-                isAbroad: false,
-            },
-            timing: {
-                firstSeenOkayAt: 0,
-                lastSeenOkayAt: 0,
-                firstSeenHospitalAt: 0,
-                lastSeenHospitalAt: 0,
-                firstSeenTravelingAt: 0,
-                lastSeenTravelingAt: 0,
-                firstSeenReturningAt: 0,
-                lastSeenReturningAt: 0,
-            },
+          ensureUserRecord(id, {
             ff: {
-                visibleFairFight: '',
-                visibleEstimatedStats: '',
-                estimatedStats: null,
-                estimatedStatsHuman: '',
-                lastRefreshAt: 0,
-                source: 'unknown',
+              fairFight: Number.isFinite(Number(row.value)) ? Number(row.value) : null,
+              estimatedStats: Number.isFinite(Number(row.bs_estimate)) ? Number(row.bs_estimate) : null,
+              estimatedStatsHuman: row.bs_estimate_human || "",
+              distributionHuman: row.distribution_human || "",
+              distributionLastUpdated: row.distribution_last_updated ? Number(row.distribution_last_updated) : null,
+              ffLastUpdated: row.last_updated ? Number(row.last_updated) : null,
+              lastRefreshAt: now(),
+              source: "ff_batch_api",
             },
+          });
+
+          mergedUsers.push(id);
+        }
+
+        await writeFFRowsToCache(direct.rows);
+
+        const headers = direct.rateHeaders || {};
+        state.core.api.status.ffRateLimitLimit = toNumber(headers["x-ratelimit-limit"]);
+        state.core.api.status.ffRateLimitRemaining = toNumber(headers["x-ratelimit-remaining"]);
+        state.core.api.status.ffRateLimitResetAt = headers["x-ratelimit-reset-timestamp"]
+          ? toEpochMs(Number(headers["x-ratelimit-reset-timestamp"]))
+          : null;
+
+        const data = {
+          userIds: uniqueIds,
+          mergedUserIds: mergedUsers,
+          found: mergedUsers.length,
+          missing: uniqueIds.length - mergedUsers.length,
+          status: "ok",
+        };
+
+        state.core.api.cache.ff[cacheKey] = { ts: now(), data };
+        state.core.api.stats.lastBatchFFAt = now();
+        state.core.api.status.ffLastSuccessAt = now();
+        state.core.api.status.ffLastError = "";
+        delete state.core.api.inFlight[cacheKey];
+        publishCore(true);
+
+        resolve({ ok: true, source: "ff_batch_api", data });
+        return;
+      }
+
+      const ffRows = await loadFFRowsByUserIds(uniqueIds);
+      const mergedUsers = [];
+
+      for (const id of uniqueIds) {
+        const row = ffRows[String(id)];
+        if (!row) continue;
+
+        ensureUserRecord(id, {
+          ff: {
+            fairFight: Number.isFinite(Number(row.value)) ? Number(row.value) : null,
+            estimatedStats: Number.isFinite(Number(row.bs_estimate)) ? Number(row.bs_estimate) : null,
+            estimatedStatsHuman: row.bs_estimate_human || "",
+            distributionHuman: row.distribution_human || "",
+            distributionLastUpdated: row.distribution_last_updated ? Number(row.distribution_last_updated) : null,
+            ffLastUpdated: row.last_updated ? Number(row.last_updated) : null,
+            lastRefreshAt: now(),
+            source: "ff_cache_db",
+          },
+        });
+        mergedUsers.push(id);
+      }
+
+      const data = {
+        userIds: uniqueIds,
+        mergedUserIds: mergedUsers,
+        found: mergedUsers.length,
+        missing: uniqueIds.length - mergedUsers.length,
+        status: mergedUsers.length ? "cache_fallback" : "error",
+        error: direct.error || "FF refresh failed",
+      };
+
+      state.core.api.cache.ff[cacheKey] = { ts: now(), data };
+      state.core.api.stats.lastBatchFFAt = now();
+      state.core.api.status.ffLastError = direct.error || "FF refresh failed";
+      delete state.core.api.inFlight[cacheKey];
+      publishCore(true);
+
+      resolve({
+        ok: mergedUsers.length > 0,
+        source: mergedUsers.length ? "ff_cache_db" : "error",
+        data,
+        error: direct.error || "FF refresh failed",
+      });
+    });
+
+    state.core.api.inFlight[cacheKey] = promise;
+    return promise;
+  }
+
+  async function brokerTornBatch(userIds, cacheKey, payload = {}) {
+    const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
+    if (!uniqueIds.length) {
+      return { ok: true, source: "policy", data: { userIds: [], results: {}, usedApi: false } };
+    }
+
+    const cached = state.core.api.cache.torn[cacheKey];
+    if (!payload.forceFresh && isFresh(cached, state.cfg.tornBatchTtlMs)) {
+      return { ok: true, source: "cache", data: cached.data };
+    }
+
+    if (state.core.api.inFlight[cacheKey]) return state.core.api.inFlight[cacheKey];
+
+    const promise = new Promise(async (resolve) => {
+      const results = {};
+      const maxBatch = clamp(Number(state.cfg.tornMaxBatchSize) || 15, 1, 25);
+
+      for (const id of uniqueIds.slice(0, maxBatch)) {
+        const apiResult = await requestTornProfileApi(id, !!payload.forceFresh);
+
+        if (apiResult.ok) {
+          ensureUserRecord(id, {
             torn: {
-                status: '',
-                hospitalUntil: 0,
-                hospitalEtaText: '',
-                lastRefreshAt: 0,
-                source: 'unknown',
-            }
-        };
-
-        const merged = mergeUserRecord(existing, patch);
-        merged.seen.lastSeenAt = now();
-        merged.seen.lastSeenHref = location.href;
-        merged.seen.lastSeenPageType = state.core.dom.page.type;
-
-        applyUserDerivedTiming(merged);
-
-        state.core.users.byId[key] = merged;
-        return merged;
-    }
-
-    function applyUserDerivedTiming(user) {
-        const t = now();
-        const status = (user.dom.statusText || '').toLowerCase();
-        const hospitalText = (user.dom.hospitalText || '').toLowerCase();
-        const travelText = (user.dom.travelText || '').toLowerCase();
-
-        user.derived.isOkay = status === 'okay';
-        user.derived.isHospitalized = status === 'hospital' || hospitalText.includes('hospital');
-        user.derived.isTraveling = status === 'traveling' || travelText.includes('traveling');
-        user.derived.isReturning = travelText.includes('returning to torn');
-        user.derived.isAbroad = user.derived.isTraveling || /traveling to|returning to|in [a-z]/i.test(user.dom.travelText || '');
-
-        if (user.derived.isOkay) {
-            if (!user.timing.firstSeenOkayAt) user.timing.firstSeenOkayAt = t;
-            user.timing.lastSeenOkayAt = t;
-        }
-        if (user.derived.isHospitalized) {
-            if (!user.timing.firstSeenHospitalAt) user.timing.firstSeenHospitalAt = t;
-            user.timing.lastSeenHospitalAt = t;
-        }
-        if (user.derived.isTraveling) {
-            if (!user.timing.firstSeenTravelingAt) user.timing.firstSeenTravelingAt = t;
-            user.timing.lastSeenTravelingAt = t;
-        }
-        if (user.derived.isReturning) {
-            if (!user.timing.firstSeenReturningAt) user.timing.firstSeenReturningAt = t;
-            user.timing.lastSeenReturningAt = t;
-        }
-
-        if (!user.links.attack && user.userId) {
-            user.links.attack = `/page.php?sid=attack&user2ID=${user.userId}`;
-        }
-    }
-
-    function scanFactionRows() {
-        if (!state.core.dom.page.isFactionPage) return;
-
-        const rows = Array.from(document.querySelectorAll('li.table-row'));
-        for (const row of rows) {
-            const profileAnchor = row.querySelector('a[href*="/profiles.php?XID="], a[href*="profiles.php?XID="]');
-            if (!profileAnchor) continue;
-
-            const userId = parseXidFromHref(profileAnchor.getAttribute('href'));
-            if (!Number.isFinite(userId)) continue;
-
-            const name =
-                normalizeText(profileAnchor.querySelector('.honor-text')?.textContent || '') ||
-                normalizeText(profileAnchor.getAttribute('aria-label') || '').replace(/^View profile of\s+/i, '') ||
-                normalizeText(profileAnchor.textContent || '');
-
-            const statusEl = row.querySelector('.table-cell.status .ellipsis, .table-cell.status span');
-            const statusText = normalizeText(statusEl?.innerText || statusEl?.textContent || '');
-            const statusClass = normalizeText(statusEl?.className || '');
-
-            const roleText = normalizeText(row.querySelector('.position .ellipsis')?.innerText || row.querySelector('.position')?.innerText || '');
-            const levelText = normalizeText(row.querySelector('.lvlCol___NAW6T, .table-cell.lvl')?.innerText || '');
-
-            const ffVisible = normalizeText(row.querySelector('.ff-scouter-ff-visible')?.innerText || '');
-            const ffEstimateVisible = normalizeText(row.querySelector('.ff-scouter-est-hidden')?.innerText || '');
-
-            ensureUserRecord(userId, {
-                name,
-                links: {
-                    profile: profileAnchor.getAttribute('href') || '',
-                },
-                dom: {
-                    statusText,
-                    statusClass,
-                    roleText,
-                    levelText,
-                },
-                ff: {
-                    visibleFairFight: ffVisible,
-                    visibleEstimatedStats: ffEstimateVisible,
-                    source: 'ff_visible_dom',
-                    lastRefreshAt: now(),
-                },
-                torn: {
-                    status: normalizeStatusText(statusText),
-                    source: 'dom_visible',
-                    lastRefreshAt: now(),
-                },
-            });
-        }
-    }
-
-    function scanProfilePage() {
-        if (!state.core.dom.page.isProfilePage) return;
-
-        const userId = parseXidFromHref(location.href);
-        if (!Number.isFinite(userId)) return;
-
-        const mainDesc = normalizeText(document.querySelector('.main-desc')?.innerText || '');
-        const subDesc = normalizeText(document.querySelector('.sub-desc')?.innerText || '');
-
-        const patch = {
-            links: {
-                profile: location.pathname + location.search,
+              status: apiResult.status || "",
+              hospitalUntil: apiResult.hospitalUntil || null,
+              hospitalEtaText: apiResult.hospitalEtaText || "",
+              lastRefreshAt: apiResult.fetchedAt || now(),
+              source: "torn_batch_api",
             },
-            dom: {},
+          });
+        }
+
+        const merged = state.core.users.byId[String(id)] || null;
+        results[String(id)] = {
+          ok: !!apiResult.ok,
+          error: apiResult.error || null,
+          errorCode: apiResult.errorCode || null,
+          usedApi: true,
+          torn: merged?.torn || null,
+        };
+      }
+
+      const data = {
+        userIds: uniqueIds.slice(0, maxBatch),
+        usedApi: true,
+        source: "torn_batch_api",
+        refreshedAt: now(),
+        results,
+      };
+
+      state.core.api.cache.torn[cacheKey] = { ts: now(), data };
+      state.core.api.stats.lastBatchTornAt = now();
+
+      const hasAnySuccess = Object.values(results).some((r) => r.ok);
+      if (hasAnySuccess) {
+        state.core.api.status.tornLastSuccessAt = now();
+        state.core.api.status.tornLastError = "";
+      } else {
+        const firstError = Object.values(results).find((r) => r.error)?.error || "Torn refresh failed";
+        state.core.api.status.tornLastError = firstError;
+      }
+
+      delete state.core.api.inFlight[cacheKey];
+      publishCore(true);
+
+      resolve({ ok: hasAnySuccess, source: "torn_batch_api", data });
+    });
+
+    state.core.api.inFlight[cacheKey] = promise;
+    return promise;
+  }
+
+  async function refreshProtectedMembers(force = false) {
+    const enabled = !!state.cfg.allianceProtectionEnabled;
+    const factions = parseProtectedFactionsText(state.cfg.protectedFactionsText);
+    const ttlMs = Math.max(60 * 1000, Number(state.cfg.allianceRefreshMs) || (3 * 24 * 60 * 60 * 1000));
+    const isFreshEnough = state.core.protectedMembers.lastRefreshAt && ((now() - Number(state.core.protectedMembers.lastRefreshAt)) < ttlMs);
+
+    if (!enabled) {
+      state.core.protectedMembers.byUserId = {};
+      state.core.protectedMembers.factionIds = [];
+      state.core.protectedMembers.lastError = "";
+      publishCore(true);
+      return {
+        ok: true,
+        source: "policy",
+        data: { enabled: false, factions: [], members: 0 },
+      };
+    }
+
+    if (!force && isFreshEnough) {
+      return {
+        ok: true,
+        source: "cache",
+        data: {
+          enabled: true,
+          factions: state.core.protectedMembers.factionIds || [],
+          members: Object.keys(state.core.protectedMembers.byUserId || {}).length,
+        },
+      };
+    }
+
+    const byUserId = {};
+    const errors = [];
+    const factionIds = factions.map((f) => f.id);
+
+    for (const faction of factions) {
+      const result = await requestFactionMembersApi(faction.id);
+
+      if (!result.ok) {
+        errors.push(`${faction.id}: ${result.error || "Unknown error"}`);
+        continue;
+      }
+
+      const membersObj = result.members || {};
+      for (const [userIdRaw, member] of Object.entries(membersObj)) {
+        const userId = Number(userIdRaw);
+        if (!Number.isFinite(userId)) continue;
+
+        const memberName = normalizeText(member?.name || "");
+        const status = normalizeStatusText(member?.status?.state || member?.status?.description || "");
+        const hospitalUntil = toEpochMs(member?.status?.until);
+
+        byUserId[String(userId)] = {
+          userId,
+          factionId: faction.id,
+          factionName: faction.name,
+          protected: true,
+          refreshedAt: now(),
         };
 
-        if (/in hospital/i.test(mainDesc)) {
-            patch.dom.hospitalText = mainDesc;
-            patch.dom.hospitalReason = subDesc;
-            patch.dom.statusText = 'Hospital';
-            patch.torn = {
-                status: 'Hospital',
-                hospitalEtaText: parseHospitalEtaText(mainDesc),
-                source: 'profile_dom',
-                lastRefreshAt: now(),
-            };
-        } else if (/traveling to/i.test(mainDesc) || /returning to torn/i.test(mainDesc)) {
-            patch.dom.travelText = mainDesc;
-            patch.dom.statusText = 'Traveling';
+        ensureUserRecord(userId, {
+          name: memberName,
+          torn: status ? {
+            status,
+            hospitalUntil,
+            lastRefreshAt: now(),
+            source: "protected_members_api",
+          } : undefined,
+          group: {
+            factionId: faction.id,
+            factionName: faction.name,
+            isProtected: true,
+            protectedLastRefreshAt: now(),
+            source: "protected_members_api",
+          },
+          seen: { lastSeenAt: now() },
+        });
+      }
+    }
 
-            const m = mainDesc.match(/traveling to\s+(.+)$/i);
-            if (m) {
-                patch.dom.travelDestination = normalizeText(m[1]);
-            }
-            patch.torn = {
-                status: 'Traveling',
-                source: 'profile_dom',
-                lastRefreshAt: now(),
-            };
-        } else if (/okay/i.test(mainDesc)) {
-            patch.dom.statusText = 'Okay';
-            patch.torn = {
-                status: 'Okay',
-                source: 'profile_dom',
-                lastRefreshAt: now(),
-            };
+    state.core.protectedMembers.byUserId = byUserId;
+    state.core.protectedMembers.factionIds = factionIds;
+    state.core.protectedMembers.lastRefreshAt = now();
+    state.core.protectedMembers.lastError = errors.join(" | ");
+
+    publishCore(true);
+
+    return {
+      ok: errors.length === 0,
+      source: "protected_members_api",
+      data: {
+        enabled: true,
+        factions: factionIds,
+        members: Object.keys(byUserId).length,
+        errors,
+      },
+    };
+  }
+
+  function handleBrokerRequest(req) {
+    const { type, payload } = req;
+    const cacheKey = makeCacheKey(type, payload);
+
+    switch (type) {
+      case "dom.state":
+        return Promise.resolve({ ok: true, source: "dom", data: state.core.dom });
+
+      case "users.visible":
+        return Promise.resolve({ ok: true, source: "cache", data: state.core.users });
+
+      case "user.visible":
+        return Promise.resolve({
+          ok: true,
+          source: "cache",
+          data: state.core.users.byId[String(payload.userId)] || null,
+        });
+
+      case "user.refresh.ff.batch":
+        return brokerFFBatch(payload.userIds || [], cacheKey, payload);
+
+      case "user.refresh.torn.batch":
+        return brokerTornBatch(payload.userIds || [], cacheKey, payload);
+
+      case "protection.refresh":
+        return refreshProtectedMembers(true);
+
+      case "user.refresh.attackLoader": {
+        const userId = Number(payload.userId);
+        const cachedUser = Number.isFinite(userId) ? (state.core.users.byId[String(userId)] || null) : null;
+        const hasRecentAttackTruth =
+          !!cachedUser &&
+          cachedUser.torn?.source === "attack_loader" &&
+          (now() - Number(cachedUser.torn?.lastRefreshAt || 0)) <= state.cfg.attackTruthTtlMs;
+
+        return Promise.resolve({
+          ok: true,
+          source: "attack_loader_recommendation",
+          data: {
+            userId: Number.isFinite(userId) ? userId : null,
+            recommendedUrl: `/page.php?sid=attack&user2ID=${Number(payload.userId) || 0}`,
+            cachedUser,
+            hasRecentAttackTruth,
+            preferredSingleRefreshPath: "attack_loader",
+          },
+        });
+      }
+
+      default:
+        return Promise.resolve({ ok: false, error: `Unknown broker request type: ${type}` });
+    }
+  }
+
+  function parseLifeBox() {
+    const lifeRegions = Array.from(document.querySelectorAll('[role="region"]')).slice(0, 20);
+
+    for (const region of lifeRegions) {
+      const txt = normalizeText(region.innerText || region.textContent || "");
+      if (!txt.includes("Life")) continue;
+
+      const valueEl = region.querySelector('p[class*="bar-value"]');
+      const valueTxt = normalizeText(valueEl?.innerText || valueEl?.textContent || "");
+      const m = valueTxt.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+      if (m) {
+        const current = Number(m[1].replace(/,/g, ""));
+        const max = Number(m[2].replace(/,/g, ""));
+        if (Number.isFinite(current) && Number.isFinite(max) && max > 0) {
+          return { current, max, source: "life-region" };
         }
-
-        ensureUserRecord(userId, patch);
+      }
     }
 
-    function scanAttackPageTarget() {
-        if (!state.core.dom.page.isAttackPage) return;
+    return { current: null, max: null, source: "" };
+  }
 
-        const targetUserId = state.core.dom.combat.targetUserId;
-        if (!Number.isFinite(targetUserId)) return;
+  function parseCashBox() {
+    const el = document.querySelector("#user-money");
+    if (!el) return { onHand: null, source: "" };
 
-        const dialogText = state.core.dom.combat.targetHospitalDialog;
-        const etaText = state.core.dom.combat.targetReleaseEtaText;
+    const dataMoney = toNumber(el.getAttribute("data-money"));
+    const txtValue = parseMoney(el.innerText || el.textContent || "");
+    return { onHand: dataMoney ?? txtValue, source: "#user-money" };
+  }
 
-        if (dialogText) {
-            ensureUserRecord(targetUserId, {
-                dom: {
-                    hospitalText: dialogText,
-                    statusText: 'Hospital',
-                },
-                torn: {
-                    status: 'Hospital',
-                    hospitalEtaText: etaText || '',
-                    lastRefreshAt: now(),
-                    source: 'attack_loader',
-                },
-            });
-        }
+  function parseHospitalGlobal() {
+    const icon = document.querySelector('a[aria-label^="Hospital:"]');
+    return {
+      hasGlobalHospitalIcon: !!icon,
+      label: icon?.getAttribute("aria-label") || "",
+    };
+  }
+
+  function parseAttackPage() {
+    const title = Array.from(document.querySelectorAll("h4")).find(
+      (el) => normalizeText(el.innerText || el.textContent || "").toLowerCase() === "attacking"
+    );
+
+    const dialog = Array.from(document.querySelectorAll("div")).find((el) => {
+      const txt = normalizeText(el.innerText || el.textContent || "");
+      return txt.includes("currently in hospital and cannot be attacked") || txt.includes("Release ETA:");
+    });
+
+    const dialogText = normalizeText(dialog?.innerText || dialog?.textContent || "");
+    const etaMatch = dialogText.match(/Release ETA:\s*(.+?)\.?$/i);
+    const targetUserId = parseUser2IdFromHref(location.href);
+
+    return {
+      onAttackPage: !!title || location.href.toLowerCase().includes("sid=attack"),
+      targetHospitalDialog: dialogText || "",
+      targetReleaseEtaText: etaMatch ? etaMatch[1].trim() : "",
+      targetUserId: Number.isFinite(targetUserId) ? targetUserId : null,
+    };
+  }
+
+  function getPageType() {
+    const href = location.href.toLowerCase();
+    const path = location.pathname.toLowerCase();
+    if (href.includes("sid=attack")) return "attack";
+    if (path.includes("/factions.php")) return "faction";
+    if (path.includes("/profiles.php")) return "profile";
+    if (path.includes("/bazaar.php")) return "bazaar";
+    if (path.includes("/trade.php")) return "trade";
+    if (path.includes("/properties.php")) return "properties";
+    return "other";
+  }
+
+  function updateDomState() {
+    const t = now();
+    const pageType = getPageType();
+    const life = parseLifeBox();
+    const cash = parseCashBox();
+    const hospital = parseHospitalGlobal();
+    const combat = parseAttackPage();
+
+    const prevLife = state.prev.lifeCurrent;
+    const prevCash = state.prev.cashOnHand;
+
+    const lifeDelta = (Number.isFinite(life.current) && Number.isFinite(prevLife)) ? life.current - prevLife : null;
+    const lifeDrop = (Number.isFinite(lifeDelta) && lifeDelta < 0) ? Math.abs(lifeDelta) : 0;
+    const lifeRise = (Number.isFinite(lifeDelta) && lifeDelta > 0) ? lifeDelta : 0;
+    const cashDelta = (Number.isFinite(cash.onHand) && Number.isFinite(prevCash)) ? cash.onHand - prevCash : null;
+    const cashIncrease = (Number.isFinite(cashDelta) && cashDelta > 0) ? cashDelta : 0;
+
+    const lifePct = (Number.isFinite(life.current) && Number.isFinite(life.max) && life.max > 0)
+      ? (life.current / life.max) * 100
+      : null;
+
+    state.core.dom.ts = t;
+    state.core.dom.domVersion = ++state.version;
+    state.core.dom.url = {
+      href: location.href,
+      path: location.pathname,
+      hash: location.hash,
+      changed: location.href !== state.prev.href,
+      pathChanged: location.pathname !== state.prev.path,
+      hashChanged: location.hash !== state.prev.hash,
+    };
+    state.core.dom.page = {
+      type: pageType,
+      isPropertiesPage: pageType === "properties",
+      isVaultPage: false,
+      isAttackPage: pageType === "attack",
+      isTradePage: pageType === "trade",
+      isBazaarPage: pageType === "bazaar",
+      isFactionPage: pageType === "faction",
+      isProfilePage: pageType === "profile",
+    };
+    state.core.dom.life = {
+      current: life.current,
+      max: life.max,
+      pct: lifePct,
+      delta: lifeDelta,
+      drop: lifeDrop,
+      rise: lifeRise,
+      changed: Number.isFinite(lifeDelta) && lifeDelta !== 0,
+      source: life.source,
+    };
+    state.core.dom.cash = {
+      onHand: cash.onHand,
+      delta: cashDelta,
+      increase: cashIncrease,
+      changed: Number.isFinite(cashDelta) && cashDelta !== 0,
+      source: cash.source,
+    };
+    state.core.dom.hospital = hospital;
+    state.core.dom.combat = {
+      attackDetected: !!combat.onAttackPage || lifeDrop > 0,
+      onAttackPage: !!combat.onAttackPage,
+      targetHospitalDialog: combat.targetHospitalDialog,
+      targetReleaseEtaText: combat.targetReleaseEtaText,
+      targetUserId: combat.targetUserId,
+    };
+
+    state.prev.href = location.href;
+    state.prev.path = location.pathname;
+    state.prev.hash = location.hash;
+    if (Number.isFinite(life.current)) state.prev.lifeCurrent = life.current;
+    if (Number.isFinite(cash.onHand)) state.prev.cashOnHand = cash.onHand;
+  }
+
+  function scanGenericProfileLinks() {
+    const anchors = Array.from(document.querySelectorAll('a[href*="profiles.php?XID="], a[href*="bazaar.php?userId="], a[href*="loader.php?sid=attack&user2ID="]'));
+    for (const anchor of anchors.slice(0, 400)) {
+      const userId =
+        parseXidFromHref(anchor.href) ??
+        parseUserIdFromHref(anchor.href) ??
+        parseUser2IdFromHref(anchor.href);
+
+      if (!Number.isFinite(userId)) continue;
+
+      let name = "";
+      const text = normalizeText(anchor.textContent || "");
+      if (text && text.length <= 40) name = text;
+
+      const protectedInfo = state.core.protectedMembers.byUserId[String(userId)] || null;
+
+      ensureUserRecord(userId, {
+        name,
+        seen: { lastSeenAt: now() },
+        dom: {
+          statusText: "",
+          source: "dom_visible",
+          lastSeenAt: now(),
+        },
+        group: protectedInfo ? {
+          factionId: protectedInfo.factionId,
+          factionName: protectedInfo.factionName,
+          isProtected: true,
+          protectedLastRefreshAt: protectedInfo.refreshedAt || now(),
+          source: "protected_members_api",
+        } : undefined,
+      });
+    }
+  }
+
+  function scanProfilePage() {
+    if (!state.core.dom.page.isProfilePage) return;
+    const userId = parseXidFromHref(location.href);
+    if (!Number.isFinite(userId)) return;
+
+    const text = normalizeText(document.body?.innerText || "");
+    let status = "";
+    if (text.includes("Okay")) status = "Okay";
+    else if (text.includes("Hospital")) status = "Hospital";
+    else if (text.includes("Traveling")) status = "Traveling";
+
+    ensureUserRecord(userId, {
+      seen: { lastSeenAt: now() },
+      dom: {
+        statusText: status,
+        source: "profile_dom",
+        lastSeenAt: now(),
+      },
+      torn: status ? {
+        status,
+        lastRefreshAt: now(),
+        source: "profile_dom",
+      } : undefined,
+    });
+  }
+
+  function scanAttackPageTarget() {
+    if (!state.core.dom.page.isAttackPage) return;
+    const targetUserId = Number(state.core.dom.combat.targetUserId);
+    if (!Number.isFinite(targetUserId)) return;
+
+    const dialog = state.core.dom.combat.targetHospitalDialog || "";
+    const eta = state.core.dom.combat.targetReleaseEtaText || "";
+    const isHospital = /hospital/i.test(dialog);
+
+    ensureUserRecord(targetUserId, {
+      seen: { lastSeenAt: now() },
+      torn: {
+        status: isHospital ? "Hospital" : "",
+        hospitalEtaText: eta,
+        lastRefreshAt: now(),
+        source: "attack_loader",
+      },
+    });
+  }
+
+  function pruneStaleUsers() {
+    const cutoff = now() - Math.max(30 * 1000, Number(state.cfg.visibleUserStaleMs) || 120000);
+    const attackTruthCutoff = now() - Math.max(30 * 1000, Number(state.cfg.attackTruthTtlMs) || 60000);
+    const profileTruthCutoff = now() - Math.max(60 * 1000, Number(state.cfg.profileTruthTtlMs) || 300000);
+
+    for (const [key, user] of Object.entries(state.core.users.byId)) {
+      user.seen.isStale = Number(user.seen.lastSeenAt || 0) < cutoff;
+      user.seen.attackTruthStale = !(
+        user.torn?.source === "attack_loader" &&
+        Number(user.torn?.lastRefreshAt || 0) >= attackTruthCutoff
+      );
+      user.seen.profileTruthStale = !(
+        user.torn?.source === "profile_dom" &&
+        Number(user.torn?.lastRefreshAt || 0) >= profileTruthCutoff
+      );
+
+      const protectedInfo = state.core.protectedMembers.byUserId[String(user.userId)] || null;
+      if (protectedInfo) {
+        user.group = {
+          ...user.group,
+          factionId: protectedInfo.factionId,
+          factionName: protectedInfo.factionName,
+          isProtected: true,
+          protectedLastRefreshAt: protectedInfo.refreshedAt || now(),
+          source: "protected_members_api",
+        };
+      }
+
+      state.core.users.byId[key] = user;
+    }
+  }
+
+  function runPageAdapters() {
+    updateDomState();
+    scanGenericProfileLinks();
+    scanProfilePage();
+    scanAttackPageTarget();
+    pruneStaleUsers();
+    state.core.ts = now();
+  }
+
+  function computeDomPollMs() {
+    const dom = state.core.dom;
+    if (dom.page.isAttackPage) return state.cfg.domPollFastMs;
+    if (dom.page.isFactionPage || dom.page.isTradePage || dom.page.isProfilePage) return state.cfg.domPollMediumMs;
+    return state.cfg.domPollSlowMs;
+  }
+
+  function restartDomLoop() {
+    if (state.loops.dom) clearTimeout(state.loops.dom);
+    const delay = clamp(Number(computeDomPollMs()) || state.cfg.domPollMediumMs, 100, 10000);
+    state.loops.dom = setTimeout(() => domTick(false), delay);
+  }
+
+  function domTick(force = false) {
+    if (!state.cfg.enabled) {
+      restartDomLoop();
+      return;
     }
 
-    function scanGenericProfileLinks() {
-        const anchors = Array.from(document.querySelectorAll('a[href*="/profiles.php?XID="], a[href*="profiles.php?XID="]')).slice(0, 200);
+    maybeBecomeLeader();
+    refreshApiStatus();
+    runPageAdapters();
 
-        for (const anchor of anchors) {
-            const userId = parseXidFromHref(anchor.getAttribute('href'));
-            if (!Number.isFinite(userId)) continue;
-
-            const name =
-                normalizeText(anchor.querySelector('.honor-text')?.textContent || '') ||
-                normalizeText(anchor.getAttribute('aria-label') || '').replace(/^View profile of\s+/i, '') ||
-                normalizeText(anchor.textContent || '');
-
-            ensureUserRecord(userId, {
-                name,
-                links: {
-                    profile: anchor.getAttribute('href') || '',
-                },
-            });
-        }
+    if (state.isLeader) {
+      publishCore(force);
+    } else {
+      renderPanel();
+      exposeWindowApi();
     }
 
-    function pruneStaleUsers() {
-        const staleMs = state.cfg.visibleUserStaleMs;
-        const cutoff = now() - staleMs;
-        const attackTruthCutoff = now() - state.cfg.attackTruthTtlMs;
-        const profileTruthCutoff = now() - state.cfg.profileTruthTtlMs;
+    restartDomLoop();
+  }
 
-        for (const [key, user] of Object.entries(state.core.users.byId)) {
-            if (Number(user.seen.lastSeenAt || 0) < cutoff) {
-                // Keep cached but mark stale instead of deleting for now.
-                user.seen.isStale = true;
-            } else {
-                user.seen.isStale = false;
-            }
+  function escapeHtml(text) {
+    return String(text || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
 
-            user.seen.attackTruthStale = !(
-                user.torn?.source === 'attack_loader' &&
-                Number(user.torn?.lastRefreshAt || 0) >= attackTruthCutoff
-            );
-            user.seen.profileTruthStale = !(
-                user.torn?.source === 'profile_dom' &&
-                Number(user.torn?.lastRefreshAt || 0) >= profileTruthCutoff
-            );
-            state.core.users.byId[key] = user;
-        }
+  function buildPanelHtml() {
+    const tornSet = !!String(state.cfg.tornApiKey || "").trim();
+    const ffSet = !!String(state.cfg.ffApiKey || "").trim();
+    const status = state.core.api.status || {};
+    const apiStats = state.core.api.stats || {};
+    const protectedCount = Object.keys(state.core.protectedMembers.byUserId || {}).length;
+
+    return `
+      <div id="torn-core-head">
+        <span>Torn Core v2</span>
+        <span>${state.isLeader ? "Leader" : "Follower"}</span>
+      </div>
+      <div id="torn-core-body" ${GM_getValue(STORAGE_KEYS.panelCollapsed, false) ? 'style="display:none;"' : ""}>
+        <div class="tc-row"><strong>Page:</strong> ${state.core.dom.page.type}</div>
+        <div class="tc-row"><strong>Tab:</strong> ${state.tabId.slice(-8)}</div>
+        <div class="tc-row"><strong>Torn key:</strong> ${tornSet ? "set" : "missing"} | <strong>FF key:</strong> ${ffSet ? "set" : "missing"}</div>
+        <div class="tc-row"><strong>Users cached:</strong> ${Object.keys(state.core.users.byId).length}</div>
+        <div class="tc-row"><strong>Torn last:</strong> ${fmtAgo(status.tornLastSuccessAt)} | <strong>FF last:</strong> ${fmtAgo(status.ffLastSuccessAt)}</div>
+        <div class="tc-row"><strong>Torn batch:</strong> ${fmtAgo(apiStats.lastBatchTornAt)} | <strong>FF batch:</strong> ${fmtAgo(apiStats.lastBatchFFAt)}</div>
+        <div class="tc-row"><strong>FF remaining:</strong> ${status.ffRateLimitRemaining ?? "-"} / ${status.ffRateLimitLimit ?? "-"}</div>
+
+        <div class="tc-divider"></div>
+        <div class="tc-row"><strong>Protection enabled:</strong> ${state.cfg.allianceProtectionEnabled ? "yes" : "no"}</div>
+        <div class="tc-row"><strong>Protected members:</strong> ${protectedCount}</div>
+        <div class="tc-row"><strong>Protection refresh:</strong> ${fmtAgo(state.core.protectedMembers.lastRefreshAt)}</div>
+        ${state.core.protectedMembers.lastError ? `<div class="tc-error">Protection: ${escapeHtml(state.core.protectedMembers.lastError)}</div>` : ""}
+        ${status.tornLastError ? `<div class="tc-error">Torn: ${escapeHtml(status.tornLastError)}</div>` : ""}
+        ${status.ffLastError ? `<div class="tc-error">FF: ${escapeHtml(status.ffLastError)}</div>` : ""}
+
+        <label class="tc-label" for="tc-torn-key">Torn API key</label>
+        <input id="tc-torn-key" class="tc-input" type="password" value="${escapeHtml(state.cfg.tornApiKey || "")}" placeholder="Torn limited/full key">
+
+        <label class="tc-label" for="tc-ff-key">FF Scouter API key</label>
+        <input id="tc-ff-key" class="tc-input" type="password" value="${escapeHtml(state.cfg.ffApiKey || "")}" placeholder="FF Scouter key">
+
+        <div class="tc-divider"></div>
+
+        <div class="tc-check">
+          <input id="tc-enabled" type="checkbox" ${state.cfg.enabled ? "checked" : ""}>
+          <label for="tc-enabled">Enabled</label>
+        </div>
+
+        <div class="tc-check">
+          <input id="tc-protection-enabled" type="checkbox" ${state.cfg.allianceProtectionEnabled ? "checked" : ""}>
+          <label for="tc-protection-enabled">Enable alliance protection</label>
+        </div>
+
+        <div class="tc-check">
+          <input id="tc-protection-skip" type="checkbox" ${state.cfg.allianceSkipPollingProtected ? "checked" : ""}>
+          <label for="tc-protection-skip">Skip polling protected targets</label>
+        </div>
+
+        <div class="tc-check">
+          <input id="tc-protection-blue" type="checkbox" ${state.cfg.allianceHighlightBlue ? "checked" : ""}>
+          <label for="tc-protection-blue">Highlight protected targets blue</label>
+        </div>
+
+        <label class="tc-label" for="tc-protection-factions">Protected factions</label>
+        <textarea id="tc-protection-factions" class="tc-textarea" placeholder="48635|Combat Ready Rockstars">${escapeHtml(state.cfg.protectedFactionsText || "")}</textarea>
+
+        <div class="tc-buttons">
+          <button id="tc-save">Save</button>
+          <button id="tc-force-publish">Publish</button>
+        </div>
+        <div class="tc-buttons">
+          <button id="tc-refresh-protection">Refresh protection now</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function createPanel() {
+    if (!state.cfg.showPanel || isWeav3rPage()) return;
+
+    GM_addStyle(`
+      #torn-core-panel {
+        position: fixed;
+        left: ${Number(GM_getValue(STORAGE_KEYS.panelX, 18)) || 18}px;
+        top: ${Number(GM_getValue(STORAGE_KEYS.panelY, 80)) || 80}px;
+        width: 380px;
+        z-index: 999999;
+        background: rgba(14,18,28,0.96);
+        color: #eef3ff;
+        border: 1px solid rgba(120,150,255,0.28);
+        border-radius: 12px;
+        box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+        font: 12px/1.4 Arial, sans-serif;
+      }
+      #torn-core-panel * { box-sizing: border-box; }
+      #torn-core-head {
+        padding: 8px 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: move;
+        border-bottom: 1px solid rgba(120,150,255,0.15);
+        user-select: none;
+        font-weight: 700;
+      }
+      #torn-core-body { padding: 10px; }
+      .tc-row { margin-bottom: 6px; color: #d9e4ff; }
+      .tc-divider {
+        margin: 10px 0;
+        border-top: 1px solid rgba(120,150,255,0.15);
+      }
+      .tc-error {
+        margin: 6px 0;
+        padding: 6px 8px;
+        border-radius: 8px;
+        background: rgba(127,29,29,0.45);
+        border: 1px solid rgba(248,113,113,0.45);
+        color: #fee2e2;
+      }
+      .tc-label {
+        display: block;
+        margin: 8px 0 4px;
+        color: #cdd7f6;
+      }
+      .tc-input, .tc-textarea {
+        width: 100%;
+        padding: 8px 9px;
+        border-radius: 8px;
+        border: 1px solid rgba(120,150,255,0.22);
+        background: rgba(23,29,44,0.96);
+        color: #fff;
+      }
+      .tc-textarea {
+        min-height: 110px;
+        resize: vertical;
+        font-family: monospace;
+        line-height: 1.35;
+      }
+      .tc-check {
+        margin-top: 10px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .tc-buttons {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      .tc-buttons button {
+        flex: 1;
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 8px;
+        cursor: pointer;
+        background: #335dff;
+        color: white;
+        font-weight: 700;
+      }
+    `);
+
+    if (!state.panel) {
+      state.panel = document.createElement("div");
+      state.panel.id = "torn-core-panel";
+      document.body.appendChild(state.panel);
     }
 
-    function runPageAdapters() {
-        updateDomState();
-        scanGenericProfileLinks();
-        scanFactionRows();
-        scanProfilePage();
-        scanAttackPageTarget();
-        pruneStaleUsers();
+    renderPanel();
+    wirePanelEvents();
+  }
 
-        state.core.ts = now();
-    }
+  function wirePanelEvents() {
+    if (!state.panel) return;
 
-    function computeDomPollMs() {
-        const dom = state.core.dom;
-        if (dom.page.isVaultPage || dom.page.isAttackPage) return state.cfg.domPollFastMs;
-        if (dom.page.isFactionPage || dom.page.isTradePage || dom.page.isProfilePage) return state.cfg.domPollMediumMs;
-        return state.cfg.domPollSlowMs;
-    }
+    const head = state.panel.querySelector("#torn-core-head");
+    const body = state.panel.querySelector("#torn-core-body");
+    if (!head || !body) return;
 
-    function restartDomLoop() {
-        if (state.loops.dom) clearInterval(state.loops.dom);
-        const delay = clamp(Number(computeDomPollMs()) || state.cfg.domPollMediumMs, 100, 10000);
-        state.loops.dom = setInterval(domTick, delay);
-    }
+    head.ondblclick = () => {
+      const collapsed = body.style.display === "none";
+      body.style.display = collapsed ? "" : "none";
+      GM_setValue(STORAGE_KEYS.panelCollapsed, !collapsed);
+    };
 
-    function domTick(force = false) {
-        if (!state.cfg.enabled) return;
+    let drag = null;
+    head.onmousedown = (e) => {
+      if (e.target.closest("button,input,textarea,label")) return;
+      drag = {
+        startX: e.clientX,
+        startY: e.clientY,
+        left: state.panel.offsetLeft,
+        top: state.panel.offsetTop,
+      };
+      e.preventDefault();
+    };
 
-        maybeBecomeLeader();
-        runPageAdapters();
+    document.addEventListener("mousemove", (e) => {
+      if (!drag) return;
+      const left = drag.left + (e.clientX - drag.startX);
+      const top = drag.top + (e.clientY - drag.startY);
+      state.panel.style.left = `${left}px`;
+      state.panel.style.top = `${top}px`;
+      GM_setValue(STORAGE_KEYS.panelX, left);
+      GM_setValue(STORAGE_KEYS.panelY, top);
+    });
+
+    document.addEventListener("mouseup", () => {
+      drag = null;
+    });
+
+    const saveBtn = state.panel.querySelector("#tc-save");
+    const publishBtn = state.panel.querySelector("#tc-force-publish");
+    const protectionBtn = state.panel.querySelector("#tc-refresh-protection");
+
+    if (saveBtn) {
+      saveBtn.onclick = async () => {
+        state.cfg.enabled = !!state.panel.querySelector("#tc-enabled")?.checked;
+        state.cfg.tornApiKey = String(state.panel.querySelector("#tc-torn-key")?.value || "").trim();
+        state.cfg.ffApiKey = String(state.panel.querySelector("#tc-ff-key")?.value || "").trim();
+        state.cfg.allianceProtectionEnabled = !!state.panel.querySelector("#tc-protection-enabled")?.checked;
+        state.cfg.allianceSkipPollingProtected = !!state.panel.querySelector("#tc-protection-skip")?.checked;
+        state.cfg.allianceHighlightBlue = !!state.panel.querySelector("#tc-protection-blue")?.checked;
+        state.cfg.protectedFactionsText = String(state.panel.querySelector("#tc-protection-factions")?.value || "").trim();
+
+        saveSettings();
+        refreshApiStatus();
+        publishCore(true);
 
         if (state.isLeader) {
-            publishCore(force);
-        } else {
-            renderPanel();
-            exposeWindowApi();
+          await refreshProtectedMembers(true);
         }
-
-        restartDomLoop();
-    }
-
-    function createPanel() {
-        if (!state.cfg.showPanel) return;
-
-        GM_addStyle(`
-            #torn-core-panel {
-                position: fixed;
-                left: ${Number(GM_getValue(STORAGE_KEYS.panelX, 18)) || 18}px;
-                top: ${Number(GM_getValue(STORAGE_KEYS.panelY, 80)) || 80}px;
-                width: 340px;
-                z-index: 999999;
-                background: rgba(14,18,28,0.96);
-                color: #eef3ff;
-                border: 1px solid rgba(120,150,255,0.28);
-                border-radius: 12px;
-                box-shadow: 0 12px 30px rgba(0,0,0,0.35);
-                font: 12px/1.4 Arial, sans-serif;
-            }
-            #torn-core-panel * { box-sizing: border-box; }
-            #torn-core-head {
-                padding: 8px 10px;
-                display:flex;
-                justify-content:space-between;
-                align-items:center;
-                cursor:move;
-                border-bottom:1px solid rgba(120,150,255,0.15);
-                user-select:none;
-                font-weight:700;
-            }
-            #torn-core-panel.collapsed #torn-core-body { display:none; }
-            #torn-core-body { padding: 10px; }
-            .tc-row {
-                display:flex;
-                justify-content:space-between;
-                gap:8px;
-                margin:4px 0;
-            }
-            .tc-actions {
-                display:flex;
-                gap:6px;
-            }
-            .tc-btn {
-                border:0;
-                background:#445;
-                color:white;
-                border-radius:6px;
-                padding:4px 8px;
-                cursor:pointer;
-            }
-            .tc-btn.primary { background:#356dff; }
-            .tc-good { color:#7CFF9B; font-weight:700; }
-            .tc-warn { color:#FFD76C; font-weight:700; }
-            .tc-bad { color:#FF9090; font-weight:700; }
-            .tc-section {
-                margin-bottom:8px;
-                padding:8px;
-                background: rgba(255,255,255,0.03);
-                border: 1px solid rgba(255,255,255,0.06);
-                border-radius:8px;
-            }
-            .tc-small {
-                font-size:11px;
-                color:#c7d2ff;
-            }
-            .tc-label {
-                display:block;
-                margin:6px 0 2px;
-                font-size:11px;
-                color:#c7d2ff;
-            }
-            .tc-input {
-                width:100%;
-                border:1px solid rgba(255,255,255,0.12);
-                background:#1d2335;
-                color:white;
-                border-radius:6px;
-                padding:6px;
-            }
-        `);
-
-        const panel = document.createElement('div');
-        panel.id = 'torn-core-panel';
-        if (GM_getValue(STORAGE_KEYS.panelCollapsed, false)) {
-            panel.classList.add('collapsed');
-        }
-
-        panel.innerHTML = `
-            <div id="torn-core-head">
-                <span>Torn Core v2</span>
-                <div class="tc-actions">
-                    <button class="tc-btn" id="tc-toggle">${panel.classList.contains('collapsed') ? '▸' : '▾'}</button>
-                    <button class="tc-btn" id="tc-enable">${state.cfg.enabled ? 'On' : 'Off'}</button>
-                    <button class="tc-btn primary" id="tc-push">Push</button>
-                </div>
-            </div>
-            <div id="torn-core-body"></div>
-        `;
-
-        document.body.appendChild(panel);
-        state.panel = panel;
-        state.panelBody = panel.querySelector('#torn-core-body');
-
-        panel.querySelector('#tc-toggle').addEventListener('click', (e) => {
-            e.stopPropagation();
-            panel.classList.toggle('collapsed');
-            GM_setValue(STORAGE_KEYS.panelCollapsed, panel.classList.contains('collapsed'));
-            panel.querySelector('#tc-toggle').textContent = panel.classList.contains('collapsed') ? '▸' : '▾';
-        });
-
-        panel.querySelector('#tc-enable').addEventListener('click', (e) => {
-            e.stopPropagation();
-            state.cfg.enabled = !state.cfg.enabled;
-            saveSettings();
-            panel.querySelector('#tc-enable').textContent = state.cfg.enabled ? 'On' : 'Off';
-            if (state.cfg.enabled) domTick(true);
-        });
-
-        panel.querySelector('#tc-push').addEventListener('click', (e) => {
-            e.stopPropagation();
-            domTick(true);
-        });
-
-        const head = panel.querySelector('#torn-core-head');
-        head.addEventListener('mousedown', (e) => {
-            state.dragging = {
-                x: e.clientX,
-                y: e.clientY,
-                left: panel.offsetLeft,
-                top: panel.offsetTop,
-            };
-        });
-
-        window.addEventListener('mouseup', () => {
-            state.dragging = null;
-        });
-
-        window.addEventListener('mousemove', (e) => {
-            if (!state.dragging) return;
-            const dx = e.clientX - state.dragging.x;
-            const dy = e.clientY - state.dragging.y;
-            const left = Math.max(0, state.dragging.left + dx);
-            const top = Math.max(0, state.dragging.top + dy);
-            panel.style.left = `${left}px`;
-            panel.style.top = `${top}px`;
-            panel.style.right = 'auto';
-            GM_setValue(STORAGE_KEYS.panelX, left);
-            GM_setValue(STORAGE_KEYS.panelY, top);
-        });
-
         renderPanel();
+      };
     }
 
-    function renderPanel() {
-        if (!state.panelBody) return;
-
-        const dom = state.core.dom;
-        const userCount = Object.keys(state.core.users.byId).length;
-        const roleClass = state.isLeader ? 'tc-good' : 'tc-warn';
-
-        state.panelBody.innerHTML = `
-            <div class="tc-section">
-                <div class="tc-row"><span>Role</span><strong class="${roleClass}">${state.isLeader ? 'Leader' : 'Follower'}</strong></div>
-                <div class="tc-row"><span>Page</span><strong>${dom.page.type}</strong></div>
-                <div class="tc-row"><span>Users cached</span><strong>${userCount}</strong></div>
-                <div class="tc-row"><span>Attack page</span><strong>${dom.page.isAttackPage ? 'Yes' : 'No'}</strong></div>
-                <div class="tc-row"><span>Vault page</span><strong>${dom.page.isVaultPage ? 'Yes' : 'No'}</strong></div>
-            </div>
-
-            <div class="tc-section">
-                <div class="tc-row"><span>Life</span><strong>${dom.life.current ?? '-'} / ${dom.life.max ?? '-'}</strong></div>
-                <div class="tc-row"><span>Life %</span><strong>${fmtPct(dom.life.pct)}</strong></div>
-                <div class="tc-row"><span>Life delta</span><strong>${dom.life.delta ?? '-'}</strong></div>
-                <div class="tc-row"><span>Cash</span><strong>${fmtMoney(dom.cash.onHand)}</strong></div>
-                <div class="tc-row"><span>Vault cash</span><strong>${fmtMoney(dom.vault.cash)}</strong></div>
-            </div>
-
-            <div class="tc-section">
-                <div class="tc-row"><span>Vault max btn</span><strong>${dom.actions.hasVaultMaxButton ? 'Yes' : 'No'}</strong></div>
-                <div class="tc-row"><span>Vault deposit</span><strong>${dom.actions.hasVaultDepositButton ? 'Yes' : 'No'}</strong></div>
-                <div class="tc-row"><span>Faction deposit</span><strong>${dom.actions.hasFactionDepositButton ? 'Yes' : 'No'}</strong></div>
-                <div class="tc-row"><span>Faction confirm</span><strong>${dom.actions.hasFactionDepositConfirmYes ? 'Yes' : 'No'}</strong></div>
-            </div>
-
-            <div class="tc-section">
-                <div class="tc-row"><span>Trade tab</span><strong>${dom.trade.hasTradeTab ? 'Yes' : 'No'}</strong></div>
-                <div class="tc-row"><span>Trade box</span><strong>${dom.trade.hasTradeTextbox ? 'Yes' : 'No'}</strong></div>
-                <div class="tc-row"><span>Hosp icon</span><strong>${dom.hospital.hasGlobalHospitalIcon ? 'Yes' : 'No'}</strong></div>
-                <div class="tc-row"><span>Attack detected</span><strong>${dom.combat.attackDetected ? 'Yes' : 'No'}</strong></div>
-            </div>
-
-            <div class="tc-section">
-                <label class="tc-label">Torn API key</label>
-                <input class="tc-input" id="tc-torn-key" type="password" value="${escapeHtml(state.cfg.tornApiKey)}" />
-                <label class="tc-label">FF API key</label>
-                <input class="tc-input" id="tc-ff-key" type="password" value="${escapeHtml(state.cfg.ffApiKey)}" />
-                <div class="tc-actions" style="margin-top:8px;">
-                    <button class="tc-btn primary" id="tc-save-settings">Save keys</button>
-                </div>
-            </div>
-
-            <div class="tc-small">
-                domVersion ${dom.domVersion} • ${new Date(dom.ts || now()).toLocaleTimeString()}
-            </div>
-        `;
-
-        const saveBtn = state.panelBody.querySelector('#tc-save-settings');
-        if (saveBtn) {
-            saveBtn.addEventListener('click', () => {
-                const tornKey = state.panelBody.querySelector('#tc-torn-key')?.value?.trim() || '';
-                const ffKey = state.panelBody.querySelector('#tc-ff-key')?.value?.trim() || '';
-                state.cfg.tornApiKey = tornKey;
-                state.cfg.ffApiKey = ffKey;
-                saveSettings();
-            });
-        }
+    if (publishBtn) {
+      publishBtn.onclick = () => {
+        refreshApiStatus();
+        publishCore(true);
+      };
     }
 
-    function escapeHtml(str) {
-        return String(str || '')
-            .replaceAll('&', '&amp;')
-            .replaceAll('<', '&lt;')
-            .replaceAll('>', '&gt;')
-            .replaceAll('"', '&quot;')
-            .replaceAll("'", '&#39;');
+    if (protectionBtn) {
+      protectionBtn.onclick = async () => {
+        if (!state.isLeader) return;
+        await refreshProtectedMembers(true);
+        renderPanel();
+      };
+    }
+  }
+
+  function renderPanel() {
+    if (!state.panel || isWeav3rPage()) return;
+    const active = document.activeElement?.id;
+    state.panel.innerHTML = buildPanelHtml();
+
+    if (active) {
+      const el = state.panel.querySelector(`#${CSS.escape(active)}`);
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
+        const valueLen = el.value.length;
+        el.focus();
+        try { el.setSelectionRange(valueLen, valueLen); } catch {}
+      }
     }
 
-    function installUnloadHandler() {
-        window.addEventListener('beforeunload', () => {
-            if (state.isLeader) clearLeaderRecord();
-            try {
-                if (state.bc) state.bc.close();
-            } catch (_) {}
-        });
-    }
+    wirePanelEvents();
+  }
 
-    function init() {
-        setupBroadcastChannel();
-
-        const snap = loadSnapshot();
-        if (snap && !state.isLeader) {
-            applySnapshot(snap);
-        }
-
-        maybeBecomeLeader();
-        exposeWindowApi();
-        createPanel();
-        installUnloadHandler();
-
-        domTick(true);
-
-        state.loops.leader = setInterval(() => {
-            maybeBecomeLeader();
-            if (state.isLeader) {
-                heartbeatLeader();
-            }
-        }, Math.max(500, Number(state.cfg.leaderHeartbeatMs) || 1500));
-
-        state.loops.ui = setInterval(() => {
-            renderPanel();
+  function exposeBridgeWindowApi(snapshot) {
+    window.TornCore = {
+      getState() {
+        return snapshot || GM_getValue(BRIDGE_KEYS.snapshot, null);
+      },
+      getDomState() {
+        return (snapshot || GM_getValue(BRIDGE_KEYS.snapshot, null))?.dom || null;
+      },
+      getUsers() {
+        return (snapshot || GM_getValue(BRIDGE_KEYS.snapshot, null))?.users || { byId: {} };
+      },
+      getUser(userId) {
+        const snap = snapshot || GM_getValue(BRIDGE_KEYS.snapshot, null);
+        return snap?.users?.byId?.[String(userId)] || null;
+      },
+      getProtectedMembers() {
+        const snap = snapshot || GM_getValue(BRIDGE_KEYS.snapshot, null);
+        return snap?.protectedMembers || { byUserId: {} };
+      },
+      request(type, payload = {}) {
+        return requestBridgeBroker(type, payload);
+      },
+      requestUsersFFRefresh(userIds = [], opts = {}) {
+        return requestBridgeBroker("user.refresh.ff.batch", { userIds, ...opts });
+      },
+      requestUsersTornRefresh(userIds = [], opts = {}) {
+        return requestBridgeBroker("user.refresh.torn.batch", { userIds, ...opts });
+      },
+      subscribe(callback) {
+        if (typeof callback !== "function") return () => {};
+        let lastTs = Number((snapshot || GM_getValue(BRIDGE_KEYS.snapshot, null))?.ts || 0);
+        const timer = setInterval(() => {
+          const next = GM_getValue(BRIDGE_KEYS.snapshot, null);
+          const ts = Number(next?.ts || 0);
+          if (ts && ts !== lastTs) {
+            lastTs = ts;
+            callback(next);
+          }
         }, 1000);
+        return () => clearInterval(timer);
+      },
+    };
+  }
+
+  function requestBridgeBroker(type, payload = {}) {
+    const requestId = `bridge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const queue = GM_getValue(BRIDGE_KEYS.requests, []);
+    queue.push({
+      id: requestId,
+      type,
+      payload,
+      createdAt: now(),
+      requester: "bridge_window_client",
+    });
+    GM_setValue(BRIDGE_KEYS.requests, queue.slice(-100));
+
+    return new Promise((resolve) => {
+      const started = now();
+      const timer = setInterval(() => {
+        const responses = GM_getValue(BRIDGE_KEYS.responses, []);
+        const hit = responses.find((item) => item?.requestId === requestId);
+        if (hit) {
+          clearInterval(timer);
+          resolve(hit.result || { ok: false, error: "Empty bridge response." });
+          return;
+        }
+        if ((now() - started) > 7000) {
+          clearInterval(timer);
+          resolve({ ok: false, timeout: true, error: "Bridge request timeout." });
+        }
+      }, 300);
+    });
+  }
+
+  function setupBridgeDomEvents() {
+    window.addEventListener("torn-core-bridge-request", (event) => {
+      const detail = event?.detail || {};
+      const requestId = detail?.id;
+      const type = String(detail?.type || "");
+      const payload = detail?.payload || {};
+      if (!requestId || !type) return;
+
+      const respond = (result) => {
+        window.dispatchEvent(new CustomEvent("torn-core-bridge-response", {
+          detail: { id: requestId, result },
+        }));
+      };
+
+      if (type === "core.getSnapshot") {
+        respond({ ok: true, data: GM_getValue(BRIDGE_KEYS.snapshot, null) || null });
+        return;
+      }
+
+      requestBridgeBroker(type, payload)
+        .then((result) => respond(result))
+        .catch((err) => respond({ ok: false, error: String(err?.message || err || "Bridge DOM request failed") }));
+    });
+  }
+
+  function initBridgeClientMode() {
+    const snap = GM_getValue(BRIDGE_KEYS.snapshot, null);
+    exposeBridgeWindowApi(snap);
+    setupBridgeDomEvents();
+  }
+
+  function installUnloadHandler() {
+    window.addEventListener("beforeunload", () => {
+      if (!state.isLeader) return;
+      const rec = GM_getValue(STORAGE_KEYS.leader, null);
+      if (rec?.tabId === state.tabId) GM_setValue(STORAGE_KEYS.leader, null);
+    });
+  }
+
+  function startProtectionLoop() {
+    if (state.loops.protection) clearInterval(state.loops.protection);
+
+    state.loops.protection = setInterval(() => {
+      if (!state.isLeader) return;
+      refreshProtectedMembers(false).catch((err) => {
+        state.core.protectedMembers.lastError = String(err?.message || err || "Protection refresh failed");
+        publishCore(true);
+      });
+    }, Math.max(60 * 1000, Number(state.cfg.allianceRefreshMs) || (3 * 24 * 60 * 60 * 1000)));
+  }
+
+  function init() {
+    if (isWeav3rPage()) {
+      initBridgeClientMode();
+      return;
     }
 
-    init();
+    setupBroadcastChannel();
+    ensureCoreShape();
+
+    const snap = loadSnapshot();
+    if (snap && !state.isLeader) applySnapshot(snap);
+
+    maybeBecomeLeader();
+    exposeWindowApi();
+    createPanel();
+    installUnloadHandler();
+
+    domTick(true);
+
+    state.loops.leader = setInterval(() => {
+      maybeBecomeLeader();
+      if (state.isLeader) heartbeatLeader();
+    }, Math.max(500, Number(state.cfg.leaderHeartbeatMs) || 1500));
+
+    state.loops.bridge = setInterval(() => {
+      processBridgeRequests();
+    }, 800);
+
+    startProtectionLoop();
+
+    if (state.isLeader) {
+      refreshProtectedMembers(false).catch((err) => {
+        state.core.protectedMembers.lastError = String(err?.message || err || "Initial protection refresh failed");
+        publishCore(true);
+      });
+    }
+  }
+
+  init();
 })();
