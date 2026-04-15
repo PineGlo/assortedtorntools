@@ -10,12 +10,14 @@
 // @match        https://www.torn.com/bazaar.php*
 // @match        https://www.torn.com/displaycase.php*
 // @match        https://www.torn.com/factions.php*
+// @match        https://www.torn.com/trade.php*
 // @match        https://torn.com/amarket.php*
 // @match        https://torn.com/page.php?sid=ItemMarket*
 // @match        https://torn.com/item.php*
 // @match        https://torn.com/bazaar.php*
 // @match        https://torn.com/displaycase.php*
 // @match        https://torn.com/factions.php*
+// @match        https://torn.com/trade.php*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      btrmmuuoofbonmuwrkzg.supabase.co
@@ -54,6 +56,8 @@
         widenSteps:       [[0,0],[25,25],[50,50],[100,100],[200,150],[400,200]],
         bonusOverrides:   {},
         market: { disableBonusFilter: false, disableQualityFilter: false },
+        bbCashValue: 0,
+        bbProfitMargin: 0,
 
         // Appearance
         style: {
@@ -250,6 +254,57 @@
 
     const fmt$ = p => p >= 1e9 ? '$'+(p/1e9).toFixed(2)+'B' : p >= 1e6 ? '$'+(p/1e6).toFixed(2)+'M' : p >= 1e3 ? '$'+(p/1e3).toFixed(1)+'K' : '$'+p.toLocaleString();
 
+    const BB_VALUE_TABLE = {
+        Pistol:        { yellow: 4,  orange: 12, orangeTwo: 18, red: 36,  redTwo: 54  },
+        SMG:           { yellow: 4,  orange: 12, orangeTwo: 18, red: 36,  redTwo: 54  },
+        Clubbing:      { yellow: 6,  orange: 18, orangeTwo: 27, red: 54,  redTwo: 81  },
+        Piercing:      { yellow: 6,  orange: 18, orangeTwo: 27, red: 54,  redTwo: 81  },
+        Slashing:      { yellow: 6,  orange: 18, orangeTwo: 27, red: 54,  redTwo: 81  },
+        Shotgun:       { yellow: 10, orange: 30, orangeTwo: 45, red: 90,  redTwo: 135 },
+        Rifle:         { yellow: 10, orange: 30, orangeTwo: 45, red: 90,  redTwo: 135 },
+        Armor:         { yellow: 12, orange: 36, orangeTwo: null, red: 108, redTwo: null },
+        'Machine Gun': { yellow: 14, orange: 42, orangeTwo: 63, red: 126, redTwo: 189 },
+        'Heavy Artillery': { yellow: 14, orange: 42, orangeTwo: 63, red: 126, redTwo: 189 },
+    };
+
+    const WEAPON_TYPE_BY_NAME = {
+        '9mm uzi': 'SMG', 'ak-47': 'Rifle', 'ak74u': 'SMG', 'armalite m-15a4': 'Rifle', 'benelli m1 tactical': 'Shotgun',
+        'benelli m4 super': 'Shotgun', 'bushmaster carbon 15': 'SMG', 'dual bushmasters': 'SMG', 'dual mp5s': 'SMG', 'dual p90s': 'SMG',
+        'dual tmps': 'SMG', 'dual uzis': 'SMG', 'egg propelled launcher': 'Heavy Artillery', 'enfield sa-80': 'Rifle',
+        'gold plated ak-47': 'Rifle', 'heckler & koch sl8': 'Rifle', 'ithaca 37': 'Shotgun', 'jackhammer': 'Shotgun',
+        'm16 a2 rifle': 'Rifle', 'm249 saw': 'Machine Gun', 'm4a1 colt carbine': 'Rifle', 'mag 7': 'Shotgun', 'minigun': 'Machine Gun',
+        'mp 40': 'SMG', 'mp5 navy': 'SMG', 'negev ng-5': 'Machine Gun', 'neutrilux 2000': 'Machine Gun', 'nock gun': 'Shotgun',
+        'p90': 'SMG', 'pkm': 'Machine Gun', 'prototype': 'Machine Gun', 'rheinmetall mg 3': 'Machine Gun',
+        'sawed-off shotgun': 'Shotgun', 'sig 550': 'Rifle', 'sig 552': 'Rifle', 'sks carbine': 'Rifle', 'snow cannon': 'Heavy Artillery',
+        'steyr aug': 'Rifle', 'stoner 96': 'Machine Gun', 'tavor tar-21': 'Rifle', 'thompson': 'SMG', 'vektor cr-21': 'Rifle',
+        'xm8 rifle': 'Rifle', 'type 98 anti tank': 'Heavy Artillery', 'beretta 92fs': 'Pistol', 'beretta m9': 'Pistol',
+        'beretta pico': 'Pistol', 'blowgun': 'Piercing', 'blunderbuss': 'Shotgun', 'bt mp9': 'SMG', 'china lake': 'Heavy Artillery',
+        'cobra derringer': 'Pistol', 'crossbow': 'Piercing', 'desert eagle': 'Pistol', 'dual 92g berettas': 'Pistol',
+        'fiveseven': 'Pistol', 'flamethrower': 'Heavy Artillery', 'flare gun': 'Pistol', 'glock 17': 'Pistol', 'harpoon': 'Piercing',
+        'homemade pocket shotgun': 'Shotgun', 'lorcin 380': 'Pistol', 'luger': 'Pistol', 'magnum': 'Pistol', 'milkor mgl': 'Heavy Artillery',
+        'mp5k': 'SMG', 'pink mac-10': 'SMG', 'qsz-92': 'Pistol', 'raven mp25': 'Pistol', 'rpg launcher': 'Heavy Artillery',
+        'ruger 57': 'Pistol', 's&w m29': 'Pistol', 's&w revolver': 'Pistol', 'skorpion': 'SMG', 'slingshot': 'Clubbing',
+        'smaw launcher': 'Heavy Artillery', 'springfield 1911': 'Pistol', 'taser': 'Piercing', 'taurus': 'Pistol', 'tmp': 'SMG',
+        'tranquilizer gun': 'Piercing', 'usp': 'Pistol', 'axe': 'Clubbing', 'baseball bat': 'Clubbing',
+        'blood spattered sickle': 'Slashing', 'bone saw': 'Slashing', 'bo staff': 'Clubbing', 'bread knife': 'Slashing',
+        'bug swatter': 'Slashing', 'butterfly knife': 'Piercing', 'cattle prod': 'Piercing', 'chain whip': 'Slashing',
+        'chainsaw': 'Slashing', 'claymore sword': 'Slashing', 'cleaver': 'Slashing', 'cricket bat': 'Clubbing',
+        'crowbar': 'Clubbing', 'dagger': 'Piercing', "devil's pitchfork": 'Piercing', 'diamond bladed knife': 'Piercing',
+        'diamond icicle': 'Piercing', 'dual axes': 'Clubbing', 'dual hammers': 'Clubbing', 'dual samurai swords': 'Slashing',
+        'dual scimitars': 'Slashing', "duke's hammer": 'Clubbing', 'fine chisel': 'Piercing', 'flail': 'Clubbing',
+        'frying pan': 'Clubbing', 'golden broomstick': 'Clubbing', 'golf club': 'Clubbing', 'guandao': 'Slashing',
+        'hammer': 'Clubbing', 'handbag': 'Clubbing', 'ice pick': 'Piercing', 'ivory walking cane': 'Clubbing',
+        'kama': 'Slashing', 'katana': 'Slashing', 'kitchen knife': 'Piercing', 'knuckle dusters': 'Clubbing', 'kodachi': 'Slashing',
+        'lead pipe': 'Clubbing', 'leather bullwhip': 'Slashing', 'macana': 'Piercing', 'madball': 'Clubbing',
+        'meat hook': 'Piercing', 'metal nunchakus': 'Clubbing', 'naval cutlass': 'Slashing', 'ninja claws': 'Piercing',
+        'pair of high heels': 'Piercing', 'pair of ice skates': 'Slashing', 'pen knife': 'Piercing', 'penelope': 'Clubbing',
+        'petrified humerus': 'Clubbing', 'pillow': 'Clubbing', 'plastic sword': 'Clubbing', 'poison umbrella': 'Piercing',
+        'riding crop': 'Slashing', 'rusty sword': 'Slashing', 'sai': 'Piercing', 'samurai sword': 'Slashing',
+        'scalpel': 'Piercing', 'scimitar': 'Slashing', 'sledgehammer': 'Clubbing', 'spear': 'Piercing', 'swiss army knife': 'Piercing',
+        'twin tiger hooks': 'Piercing', 'wand of destruction': 'Piercing', 'wooden nunchaku': 'Clubbing',
+        'wushu double axes': 'Clubbing', 'yasukuni sword': 'Slashing',
+    };
+
     function fmtDate(ts) {
         const d = Math.floor((Date.now() - ts*1000) / 86400000);
         return d === 0 ? 'Today' : d === 1 ? 'Yesterday' : d < 7 ? d+'d ago' : new Date(ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
@@ -260,6 +315,126 @@
         const r = rarity.toLowerCase();
         const cls = r.includes('red') ? 'r-red' : r.includes('orange') ? 'r-orange' : r.includes('yellow') ? 'r-yellow' : '';
         return cls ? `<span class="ah-rarity ${cls}">${rarity.toUpperCase()}</span>` : '';
+    }
+
+    const normalizeItemName = name => (name || '').toLowerCase().replace(/^the\s+/i, '').replace(/\s+/g, ' ').trim();
+
+    function getRarityKey(el) {
+        const rarity = el.querySelector('[class*="rarity___"]');
+        const text = ((rarity?.className || '') + ' ' + (rarity?.textContent || '')).toLowerCase();
+        if (text.includes('red')) return 'red';
+        if (text.includes('orange')) return 'orange';
+        if (text.includes('yellow')) return 'yellow';
+        if (el.querySelector('[class*="extremely-rare"]')) return 'red';
+        if (el.querySelector('[class*="extraordinary"]')) return 'orange';
+        return null;
+    }
+
+    function calcBunkerBucks(itemName, rarityKey, bonusCount, itemType = 'weapon') {
+        const category = itemType === 'armor' ? 'Armor' : WEAPON_TYPE_BY_NAME[normalizeItemName(itemName)];
+        if (!category) return null;
+        const row = BB_VALUE_TABLE[category];
+        if (!row) return null;
+        if (!rarityKey) return null;
+        if (rarityKey === 'yellow') return row.yellow;
+        if (rarityKey === 'orange') return bonusCount >= 2 && row.orangeTwo != null ? row.orangeTwo : row.orange;
+        if (rarityKey === 'red') return bonusCount >= 2 && row.redTwo != null ? row.redTwo : row.red;
+        return null;
+    }
+
+    function bbDisplayText(bbAmount) {
+        const bbCashValue = Number(settings.get().bbCashValue) || 0;
+        const bbProfitMargin = Math.max(0, Math.min(100, Number(settings.get().bbProfitMargin) || 0));
+        if (bbCashValue > 0) {
+            const netCash = Math.round(bbAmount * bbCashValue * (1 - (bbProfitMargin / 100)));
+            return {
+                text: `${bbAmount} BB • ${fmt$(netCash)}`,
+                title: `BB base: ${fmt$(bbCashValue)} each • margin: ${bbProfitMargin}%`,
+            };
+        }
+        return { text: `${bbAmount} BB`, title: '' };
+    }
+
+    function injectBBBage(el, bbAmount) {
+        const existing = el.querySelector('.ah-bb-badge');
+        if (existing) existing.remove();
+        if (bbAmount == null) return;
+
+        const portrait = el.querySelector('[class*="imageWrapper"],[class*="itemImage"],[class*="thumbnail"],[class*="iconWrapper"],.item-cont-wrap,.image');
+        const target = portrait || el;
+        if (getComputedStyle(target).position === 'static') target.style.position = 'relative';
+
+        const badge = document.createElement('div');
+        badge.className = 'ah-bb-badge';
+        const info = bbDisplayText(bbAmount);
+        badge.textContent = info.text;
+        if (info.title) badge.title = info.title;
+        target.appendChild(badge);
+    }
+
+    function injectCollapsedBBInfo(btn, bbAmount) {
+        const row = btn.closest('li, .item-cont-wrap, [class*="itemInfoWrapper"], [class*="itemInfo___"], [class*="auction"]') || btn.parentElement;
+        if (!row) return;
+
+        row.querySelector('.ah-bb-inline')?.remove();
+        if (bbAmount == null) return;
+
+        const info = bbDisplayText(bbAmount);
+        let container = row.querySelector('.infobonuses');
+        if (!container) {
+            container = document.createElement('div');
+            container.className = 'infobonuses';
+            btn.insertAdjacentElement('afterend', container);
+        }
+
+        const wrap = document.createElement('span');
+        wrap.className = 'bonus-attachment ah-bb-inline';
+        wrap.innerHTML = `<i class="bonus-attachment-item-bb-bonus"></i><span class="label-value t-overflow">${info.text}</span>`;
+        if (info.title) wrap.title = info.title;
+        container.insertAdjacentElement('afterbegin', wrap);
+    }
+
+    function rarityFromItemPlate(btn, fallbackRarity = null) {
+        const row = btn.closest('li, .item-cont-wrap, [class*="itemInfoWrapper"], [class*="itemInfo___"], [class*="auction"]') || btn.parentElement;
+        const plate = row?.querySelector('.item-plate');
+        const cls = plate?.className?.toLowerCase() || '';
+        if (cls.includes('glow-red')) return 'red';
+        if (cls.includes('glow-orange')) return 'orange';
+        if (cls.includes('glow-yellow')) return 'yellow';
+        return fallbackRarity;
+    }
+
+    function rarityFromAriaLabel(aria) {
+        const t = (aria || '').toLowerCase();
+        if (t.includes('extremely rare') || t.includes('very rare')) return 'red';
+        if (t.includes('extraordinary') || /\brare\b/.test(t)) return 'orange';
+        if (t.includes('uncommon') || t.includes('yellow') || t.includes('common')) return 'yellow';
+        return null;
+    }
+
+    function bonusCountFromAriaLabel(aria) {
+        const t = (aria || '').toLowerCase();
+        let count = 0;
+        for (const b of bonusList) {
+            const n = b.title.toLowerCase();
+            if (new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) count++;
+        }
+        return Math.min(2, count);
+    }
+
+    function injectCollapsedAuctionButtons() {
+        document.querySelectorAll('button.view-info').forEach(btn => {
+            const aria = btn.getAttribute('aria-label') || '';
+            if (!aria) return;
+
+            const nameMatch = aria.match(/^\s*([^.(]+?)\s*\(/);
+            const itemName = nameMatch ? nameMatch[1].trim() : '';
+            const rarityKey = rarityFromItemPlate(btn, rarityFromAriaLabel(aria));
+            const itemType = /armor:/i.test(aria) ? 'armor' : 'weapon';
+            const bonusCount = bonusCountFromAriaLabel(aria);
+            const bbAmount = calcBunkerBucks(itemName, rarityKey, bonusCount, itemType);
+            injectCollapsedBBInfo(btn, bbAmount);
+        });
     }
 
     const profileLink = (id, name) => id ? `<a href="https://www.torn.com/profiles.php?XID=${id}" target="_blank">${name||id}</a>` : 'Unknown';
@@ -779,6 +954,36 @@ function parseCurrentListingPrice() {
             font-size: 11px; font-family: Arial, sans-serif; z-index: 10; backdrop-filter: blur(4px);
         }
         .ah-btn:hover { background: rgba(40,40,40,0.9); color: #fff; }
+        .ah-bb-badge {
+            position: absolute; left: 4px; bottom: 4px;
+            padding: 2px 7px; border-radius: 999px;
+            border: 1px solid rgba(255, 214, 102, 0.45);
+            background: rgba(20,20,20,0.85); color: #ffd666;
+            font-size: 11px; font-weight: 700; z-index: 9; pointer-events: none;
+            text-shadow: 0 1px 1px rgba(0,0,0,0.5);
+        }
+        .ah-bb-inline {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin-bottom: 2px;
+        }
+        .ah-bb-inline .label-value {
+            color: #ffd666 !important;
+            font-weight: 700;
+        }
+        .bonus-attachment-item-bb-bonus::before {
+            content: "BB";
+            display: inline-block;
+            font-style: normal;
+            font-size: 9px;
+            font-weight: 700;
+            color: #ffd666;
+            border: 1px solid rgba(255, 214, 102, 0.45);
+            border-radius: 3px;
+            padding: 0 3px;
+            line-height: 1.3;
+        }
 
         /* ── Modal shell ── */
         #ah-modal {
@@ -1515,6 +1720,12 @@ function parseCurrentListingPrice() {
             </div>
 
             <div class="ah-sec">
+                <h4>Bunker Bucks Value</h4>
+                <div class="ah-row"><label>$ per BB</label><input type="number" id="s-bbvalue" value="${s.bbCashValue||0}" min="0" step="1"><span class="ah-note">Set your personal BB cash value (0 = show BB only)</span></div>
+                <div class="ah-row"><label>Profit margin</label><input type="number" id="s-bbmargin" value="${s.bbProfitMargin||0}" min="0" max="100" step="1"><span class="ah-note">Discount BB value by this % for target margin</span></div>
+            </div>
+
+            <div class="ah-sec">
                 <h4>Per-Bonus Overrides</h4>
                 ${ovrs.length ? ovrs.map(o => `
                 <div class="ah-ovr-item" data-id="${o.id}">
@@ -1577,6 +1788,8 @@ function parseCurrentListingPrice() {
         wire('s-minresults', e => settings.set({ minResults: parseInt(e.target.value)||1 }));
         wire('s-mbonus',     e => settings.setMarket({ disableBonusFilter:   e.target.checked }));
         wire('s-mqual',      e => settings.setMarket({ disableQualityFilter: e.target.checked }));
+        wire('s-bbvalue',    e => { settings.set({ bbCashValue: Math.max(0, parseInt(e.target.value) || 0) }); injectButtons(); });
+        wire('s-bbmargin',   e => { settings.set({ bbProfitMargin: Math.min(100, Math.max(0, parseInt(e.target.value) || 0)) }); injectButtons(); });
 
         modal.querySelectorAll('.ah-ovr-item').forEach(el => {
             const id = +el.dataset.id;
@@ -1701,6 +1914,7 @@ function parseCurrentListingPrice() {
         if (u.includes('item.php'))       return 'inventory';
         if (u.includes('bazaar.php'))     return 'bazaar';
         if (u.includes('displaycase.php')) return 'displaycase';
+        if (u.includes('trade.php'))      return 'trading';
         if (u.includes('factions.php') && u.includes('armoury')) return 'armory';
         return 'unknown';
     };
@@ -1764,6 +1978,9 @@ function parseCurrentListingPrice() {
 
     function injectInto(containers, checkRarity = true) {
         containers.forEach(el => {
+            const parsed = parseReactItem(el);
+            const bbAmount = calcBunkerBucks(parsed.itemName, getRarityKey(el), parsed.bonuses.length, parsed.itemType);
+            injectBBBage(el, bbAmount);
             if (el.querySelector('.ah-btn')) return;
             if (checkRarity && !hasRarity(el)) return;
             const wrap = el.querySelector('.descriptionWrapper___Lh0y0,[class*="itemInfo___"]') || el;
@@ -1777,8 +1994,11 @@ function parseCurrentListingPrice() {
             const els = document.querySelectorAll(sel);
             if (!els.length) continue;
             Array.from(els).forEach(el => {
-                if (el.querySelector('.ah-btn')) return;
                 if (!el.querySelector('[class*="propertyWrapper"],[aria-label*="Bonus"],[aria-label*="Quality"]')) return;
+                const parsed = parseReactItem(el);
+                const bbAmount = calcBunkerBucks(parsed.itemName, getRarityKey(el), parsed.bonuses.length, parsed.itemType);
+                injectBBBage(el, bbAmount);
+                if (el.querySelector('.ah-btn')) return;
                 const wrap = el.querySelector('.descriptionWrapper___Lh0y0') || el;
                 wrap.appendChild(makeBtn(() => {
                     const d = parseReactItem(el);
@@ -1802,15 +2022,17 @@ function parseCurrentListingPrice() {
             const wrap = li.querySelector('.descriptionWrapper___Lh0y0') || exp;
             wrap.style.position = 'relative';
             wrap.appendChild(makeBtn(() => {
-                const d = parseReactItem(el);
+                const d = parseLegacyItem(li);
                 document.querySelectorAll('.ah-open-source').forEach(x => x.classList.remove('ah-open-source'));
-                el.classList.add('ah-open-source');
+                li.classList.add('ah-open-source');
                 openModal(d.itemName, d.bonuses, d.quality, d.itemType, d.srcStats);
             }));
         });
     }
 
     function injectButtons() {
+        injectCollapsedAuctionButtons();
+
         const pt = getPageType();
         if (pt === 'auction') {
             injectAuction();
@@ -1820,6 +2042,10 @@ function parseCurrentListingPrice() {
             injectInto(document.querySelectorAll('li.show-item-info'));
         } else if (pt === 'bazaar') {
             injectInto(document.querySelectorAll('div.show-item-info,[class*="info___"].show-item-info'));
+        } else if (pt === 'trading') {
+            injectInto(document.querySelectorAll(
+                '.itemInfoWrapper___nA_eu,[class*="itemInfo___"],li.show-item-info,div.show-item-info,[class*="info___"].show-item-info'
+            ), false);
         } else if (pt === 'armory') {
             injectInto(Array.from(document.querySelectorAll('div.view-item-info')).filter(e => e.style.display !== 'none'));
         }
