@@ -1283,8 +1283,8 @@
         }
 
         .twx-input option {
-            color: #111827;
-            background: #f8fafc;
+            color: #e5e7eb;
+            background: #0b1220;
         }
 
         .twx-checkbox-row {
