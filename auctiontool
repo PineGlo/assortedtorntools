@@ -522,6 +522,13 @@
             return BONUS_BY_ID[id] || `Bonus #${id}`;
         },
 
+        bonusIdByName(name) {
+            const n = Util.lower(name);
+            if (!n) return null;
+            const found = BONUS_DATA.find((b) => Util.lower(b.title) === n);
+            return found?.id ?? null;
+        },
+
         summarizeBonuses(bonuses = []) {
             if (!bonuses.length) return 'None';
             return bonuses.map(b => {
@@ -1993,28 +2000,35 @@ ensurePill(item, index) {
             if (!source && filters?.includeBazaar && !filters?.includeMarket) source = 'bazaar';
             if (!source && !filters?.includeBazaar && filters?.includeMarket) source = 'market';
             if (source === 'bazaar') {
-                const userId = row?.seller_id || row?.user_id || row?.owner_id;
-                if (!userId) return '';
-                return `https://www.torn.com/bazaar.php?userId=${Number(userId)}`;
+                const userIdRaw =
+                    row?.seller_id ?? row?.sellerId ??
+                    row?.user_id ?? row?.userId ??
+                    row?.owner_id ?? row?.ownerId ??
+                    row?.uid ?? row?.userid ?? row?.bazaar_user_id;
+                const userId = Number(userIdRaw);
+                if (!Number.isFinite(userId) || userId <= 0) return '';
+                return `https://www.torn.com/bazaar.php?userId=${userId}`;
             }
 
             if (source === 'market') {
+                const wc = String(filters?.weaponClass || '').toLowerCase();
                 const categoryName = filters?.itemCategory === 'armor'
                     ? 'Armor'
-                    : (filters?.weaponClass || 'Primary');
+                    : (wc === 'secondary' ? 'Secondary' : wc === 'melee' ? 'Melee' : 'Primary');
                 const params = [
-                    `categoryName=${encodeURIComponent(categoryName)}`,
+                    `categoryName=${categoryName}`,
                     'sortField=price',
                     'sortOrder=ASC',
                 ];
 
-                const bonus1Id = row?.bonus1_id || filters?.bonus1Id;
-                if (bonus1Id) params.push(`bonuses[0]=${encodeURIComponent(String(bonus1Id))}`);
+                const bonus1Name = row?.bonus1_name ?? row?.bonus_1_name ?? null;
+                const bonus1Id = row?.bonus1_id || row?.bonus_1_id || filters?.bonus1Id || Stats.bonusIdByName(bonus1Name);
+                if (bonus1Id) params.push(`bonuses[0]=${Number(bonus1Id)}`);
 
-                const damageFrom = row?.stat_damage ?? filters?.damageMin;
                 const damageTo = row?.stat_damage ?? filters?.damageMax;
-                if (damageFrom != null && damageFrom !== '') params.push(`damageFrom=${encodeURIComponent(String(damageFrom))}`);
-                if (damageTo != null && damageTo !== '') params.push(`damageTo=${encodeURIComponent(String(damageTo))}`);
+                const accuracyTo = row?.stat_accuracy ?? filters?.accuracyMax;
+                if (damageTo != null && damageTo !== '') params.push(`damageTo=${Math.round(Number(damageTo))}`);
+                if (accuracyTo != null && accuracyTo !== '') params.push(`accuracyTo=${Math.round(Number(accuracyTo))}`);
 
                 return `https://www.torn.com/page.php?sid=ItemMarket#/market/view=category&${params.join('&')}`;
             }
