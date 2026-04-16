@@ -696,8 +696,11 @@
     const coreUser = state.coreClient?.getUser?.(userId) || null;
     const torn = coreUser?.torn || null;
     const hospitalUntil = Number(torn?.hospitalUntil) || 0;
+    const hospitalEtaText = String(torn?.hospitalEtaText || "").trim();
 
-    if (!hospitalUntil) return "";
+    if (!hospitalUntil) {
+      return hospitalEtaText ? `Hosp ${hospitalEtaText}` : "";
+    }
     const remainingMs = hospitalUntil - now();
     if (remainingMs <= 0) return "Hosp 0m";
 
