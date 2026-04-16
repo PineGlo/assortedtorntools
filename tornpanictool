@@ -486,6 +486,11 @@
         return !!leader && leader.tabId === TAB_ID && !isLeaderStale(leader);
     }
 
+    function hasActiveLeader() {
+        const leader = readLeaderState();
+        return !!leader && !isLeaderStale(leader);
+    }
+
     function maybeClaimLeadership(force = false) {
         if (!force) {
             updateUIStatus();
@@ -862,6 +867,10 @@
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
 
+        if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+            maybeClaimLeadership(true);
+        }
+
         if (amLeader()) {
             await sleep(rand());
             processDepositFlow();
@@ -872,6 +881,9 @@
         const settings = getSettings();
 
         if (isPaused()) return;
+        if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+            maybeClaimLeadership(true);
+        }
         if (!amLeader()) return;
         if (!isAutoModeEnabled()) return;
 
@@ -1740,6 +1752,9 @@
         flowWatcherStarted = true;
 
         setInterval(() => {
+            if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+                maybeClaimLeadership(true);
+            }
             if (!amLeader()) return;
             processDepositFlow();
         }, 1000);
