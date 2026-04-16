@@ -856,6 +856,27 @@
             activeTab: 'details',
         },
 
+        search: {
+            filters: {
+                itemName: '',
+                bonus1Id: '',
+                bonus1Min: '',
+                bonus1Max: '',
+                bonus2Id: '',
+                bonus2Min: '',
+                bonus2Max: '',
+                qualityMin: '',
+                qualityMax: '',
+                includeBazaar: true,
+                includeMarket: true,
+            },
+            rows: [],
+            total: 0,
+            loading: false,
+            error: null,
+            lastRunAt: 0,
+        },
+
         batch: {
             running: false,
             done: 0,
@@ -1260,6 +1281,25 @@
             font-size: 12px;
         }
 
+        .twx-checkbox-row {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+
+        .twx-checkbox {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--twx-text);
+            user-select: none;
+        }
+
+        .twx-checkbox input {
+            accent-color: var(--twx-accent);
+        }
+
         @media (max-width: 760px) {
             .twx-grid-2, .twx-grid-4 {
                 grid-template-columns: 1fr;
@@ -1390,6 +1430,7 @@ ensurePill(item, index) {
 
                 <div class="twx-tabs">
                     <button class="twx-tab active" data-twx-tab="details">Details</button>
+                    <button class="twx-tab" data-twx-tab="search">Search</button>
                     <button class="twx-tab" data-twx-tab="settings">Settings</button>
                 </div>
 
@@ -1431,6 +1472,13 @@ ensurePill(item, index) {
             if (!body || !subtitle) return;
 
             this.renderTabs();
+
+            if (AppState.ui.activeTab === 'search') {
+                subtitle.textContent = 'Search';
+                body.innerHTML = this.renderSearchTab();
+                this.bindSearchTab();
+                return;
+            }
 
             if (AppState.ui.activeTab === 'settings') {
                 subtitle.textContent = 'Settings';
@@ -1549,6 +1597,7 @@ ensurePill(item, index) {
                     <div class="twx-btn-row">
                         <button class="twx-btn" id="twx-refresh-active">Refresh This Item</button>
                         <button class="twx-btn" id="twx-price-page-from-modal">Price Entire Page</button>
+                        <button class="twx-btn" id="twx-open-search">Search</button>
                         <button class="twx-btn" id="twx-open-settings">Settings</button>
                         <button class="twx-btn" id="twx-clear-caches">Clear Cache</button>
                     </div>
@@ -1569,9 +1618,207 @@ ensurePill(item, index) {
                 this.renderActiveItem(AppState.activeItem);
             });
 
+            body.querySelector('#twx-open-search')?.addEventListener('click', () => {
+                AppState.ui.activeTab = 'search';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
             body.querySelector('#twx-clear-caches')?.addEventListener('click', () => {
                 Actions.clearCaches();
                 this.renderActiveItem(item);
+            });
+        },
+
+        renderSearchTab() {
+            const f = AppState.search.filters;
+            const rows = AppState.search.rows || [];
+            const resultRows = this.filterSearchRowsBySource(rows, f);
+            const lastRunText = AppState.search.lastRunAt
+                ? new Date(AppState.search.lastRunAt).toLocaleString()
+                : 'Never';
+
+            return `
+                <div class="twx-card">
+                    <div class="twx-card-title">Search Filters</div>
+                    <div class="twx-grid-2">
+                        <label class="twx-field">
+                            <span class="twx-label">Item Name</span>
+                            <input class="twx-input" id="twx-search-item-name" value="${Util.escapeHtml(String(f.itemName || ''))}" placeholder="e.g. ArmaLite M-15A4">
+                        </label>
+                        <div class="twx-field">
+                            <span class="twx-label">Listing Source</span>
+                            <div class="twx-checkbox-row">
+                                <label class="twx-checkbox"><input id="twx-search-include-bazaar" type="checkbox" ${f.includeBazaar ? 'checked' : ''}>Bazaar listings</label>
+                                <label class="twx-checkbox"><input id="twx-search-include-market" type="checkbox" ${f.includeMarket ? 'checked' : ''}>Market listings</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="twx-grid-2" style="margin-top:10px;">
+                        <label class="twx-field">
+                            <span class="twx-label">Bonus 1</span>
+                            <select class="twx-input" id="twx-search-bonus1-id">
+                                <option value="">All</option>
+                                ${BONUS_DATA.map(b => `<option value="${b.id}" ${String(f.bonus1Id) === String(b.id) ? 'selected' : ''}>${Util.escapeHtml(b.title)}</option>`).join('')}
+                            </select>
+                        </label>
+                        <div class="twx-grid-2">
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 1 Min %</span>
+                                <input class="twx-input" id="twx-search-bonus1-min" value="${Util.escapeHtml(String(f.bonus1Min ?? ''))}" placeholder="Min">
+                            </label>
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 1 Max %</span>
+                                <input class="twx-input" id="twx-search-bonus1-max" value="${Util.escapeHtml(String(f.bonus1Max ?? ''))}" placeholder="Max">
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="twx-grid-2" style="margin-top:10px;">
+                        <label class="twx-field">
+                            <span class="twx-label">Bonus 2</span>
+                            <select class="twx-input" id="twx-search-bonus2-id">
+                                <option value="">All</option>
+                                ${BONUS_DATA.map(b => `<option value="${b.id}" ${String(f.bonus2Id) === String(b.id) ? 'selected' : ''}>${Util.escapeHtml(b.title)}</option>`).join('')}
+                            </select>
+                        </label>
+                        <div class="twx-grid-2">
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 2 Min %</span>
+                                <input class="twx-input" id="twx-search-bonus2-min" value="${Util.escapeHtml(String(f.bonus2Min ?? ''))}" placeholder="Min">
+                            </label>
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 2 Max %</span>
+                                <input class="twx-input" id="twx-search-bonus2-max" value="${Util.escapeHtml(String(f.bonus2Max ?? ''))}" placeholder="Max">
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="twx-grid-2" style="margin-top:10px;">
+                        <label class="twx-field">
+                            <span class="twx-label">Quality Min</span>
+                            <input class="twx-input" id="twx-search-quality-min" value="${Util.escapeHtml(String(f.qualityMin ?? ''))}" placeholder="Min">
+                        </label>
+                        <label class="twx-field">
+                            <span class="twx-label">Quality Max</span>
+                            <input class="twx-input" id="twx-search-quality-max" value="${Util.escapeHtml(String(f.qualityMax ?? ''))}" placeholder="Max">
+                        </label>
+                    </div>
+
+                    <div class="twx-btn-row" style="margin-top:12px;">
+                        <button class="twx-btn" id="twx-search-run">${AppState.search.loading ? 'Searching…' : 'Run Search'}</button>
+                        <button class="twx-btn" id="twx-search-fill-active">Use Active Item</button>
+                        <button class="twx-btn" id="twx-search-clear">Clear</button>
+                    </div>
+                    <div class="twx-meta">Last run: ${Util.escapeHtml(lastRunText)}</div>
+                </div>
+
+                <div class="twx-card">
+                    <div class="twx-card-title">Search Results</div>
+                    <div class="twx-meta">Showing ${resultRows.length} of ${AppState.search.total || 0} rows.</div>
+                    ${AppState.search.error ? `<div class="twx-error" style="margin-top:8px;">${Util.escapeHtml(AppState.search.error)}</div>` : ''}
+                    ${resultRows.length ? `
+                        <div class="twx-list" style="margin-top:10px;">
+                            ${resultRows.map((r) => `
+                                <div class="twx-row">
+                                    <div class="twx-row-left">
+                                        <div class="twx-name">${Util.escapeHtml(r.item_name || 'Unknown item')}</div>
+                                        <div class="twx-meta">${Util.escapeHtml(this.getSearchRowSourceLabel(r))} • ${Util.escapeHtml(this.getSearchRowBonusesLabel(r))}</div>
+                                        <div class="twx-meta">Q ${r.stat_quality ?? '—'} • DMG ${r.stat_damage ?? '—'} • ACC ${r.stat_accuracy ?? '—'}</div>
+                                    </div>
+                                    <div class="twx-row-right">
+                                        <div class="twx-price">${Util.money(Number(r.price || 0))}</div>
+                                        <div class="twx-meta">${r.timestamp ? new Date(r.timestamp * 1000).toLocaleString() : '—'}</div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : `<div class="twx-empty" style="margin-top:10px;">${AppState.search.loading ? 'Loading search results…' : 'No results yet.'}</div>`}
+                </div>
+            `;
+        },
+
+        bindSearchTab() {
+            const saveFiltersFromDom = () => {
+                AppState.search.filters.itemName = (document.getElementById('twx-search-item-name')?.value || '').trim();
+                AppState.search.filters.bonus1Id = document.getElementById('twx-search-bonus1-id')?.value || '';
+                AppState.search.filters.bonus1Min = (document.getElementById('twx-search-bonus1-min')?.value || '').trim();
+                AppState.search.filters.bonus1Max = (document.getElementById('twx-search-bonus1-max')?.value || '').trim();
+                AppState.search.filters.bonus2Id = document.getElementById('twx-search-bonus2-id')?.value || '';
+                AppState.search.filters.bonus2Min = (document.getElementById('twx-search-bonus2-min')?.value || '').trim();
+                AppState.search.filters.bonus2Max = (document.getElementById('twx-search-bonus2-max')?.value || '').trim();
+                AppState.search.filters.qualityMin = (document.getElementById('twx-search-quality-min')?.value || '').trim();
+                AppState.search.filters.qualityMax = (document.getElementById('twx-search-quality-max')?.value || '').trim();
+                AppState.search.filters.includeBazaar = !!document.getElementById('twx-search-include-bazaar')?.checked;
+                AppState.search.filters.includeMarket = !!document.getElementById('twx-search-include-market')?.checked;
+            };
+
+            document.getElementById('twx-search-run')?.addEventListener('click', async () => {
+                saveFiltersFromDom();
+                await Actions.runSearch();
+            });
+
+            document.getElementById('twx-search-fill-active')?.addEventListener('click', () => {
+                const item = AppState.activeItem;
+                if (!item) return;
+                AppState.search.filters.itemName = item.itemName || '';
+                AppState.search.filters.bonus1Id = item.effectTypes?.[0]?.id ? String(item.effectTypes[0].id) : '';
+                AppState.search.filters.bonus2Id = item.effectTypes?.[1]?.id ? String(item.effectTypes[1].id) : '';
+                AppState.search.filters.qualityMin = item.sourceStats?.quality != null ? String(item.sourceStats.quality) : '';
+                AppState.search.filters.qualityMax = item.sourceStats?.quality != null ? String(item.sourceStats.quality) : '';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
+            document.getElementById('twx-search-clear')?.addEventListener('click', () => {
+                AppState.search.filters = {
+                    itemName: '',
+                    bonus1Id: '',
+                    bonus1Min: '',
+                    bonus1Max: '',
+                    bonus2Id: '',
+                    bonus2Min: '',
+                    bonus2Max: '',
+                    qualityMin: '',
+                    qualityMax: '',
+                    includeBazaar: true,
+                    includeMarket: true,
+                };
+                AppState.search.rows = [];
+                AppState.search.total = 0;
+                AppState.search.error = null;
+                this.renderActiveItem(AppState.activeItem);
+            });
+        },
+
+        getSearchRowSourceLabel(row) {
+            const src = String(row?.listing_source || row?.source || row?.origin || '').toLowerCase();
+            if (src.includes('bazaar')) return 'Bazaar';
+            if (src.includes('market')) return 'Market';
+            return 'Unknown source';
+        },
+
+        getSearchRowBonusesLabel(row) {
+            const b1Id = row?.bonus1_id;
+            const b2Id = row?.bonus2_id;
+            const b1Name = b1Id ? Stats.bonusName(Number(b1Id)) : null;
+            const b2Name = b2Id ? Stats.bonusName(Number(b2Id)) : null;
+            const b1v = row?.bonus1_value;
+            const b2v = row?.bonus2_value;
+            const p1 = b1Name ? `${b1Name}${b1v != null ? ` ${b1v}%` : ''}` : null;
+            const p2 = b2Name ? `${b2Name}${b2v != null ? ` ${b2v}%` : ''}` : null;
+            return [p1, p2].filter(Boolean).join(' • ') || 'No bonuses';
+        },
+
+        filterSearchRowsBySource(rows, filters) {
+            const includeBazaar = !!filters.includeBazaar;
+            const includeMarket = !!filters.includeMarket;
+            if (includeBazaar && includeMarket) return rows;
+            if (!includeBazaar && !includeMarket) return [];
+            return rows.filter((row) => {
+                const src = String(row?.listing_source || row?.source || row?.origin || '').toLowerCase();
+                if (src.includes('bazaar')) return includeBazaar;
+                if (src.includes('market')) return includeMarket;
+                return includeBazaar || includeMarket;
             });
         },
 
@@ -1783,6 +2030,26 @@ ensurePill(item, index) {
 
             ItemDecorators.refresh(AppState.items);
             UI.ensurePageBatchButton();
+        },
+
+        async runSearch() {
+            AppState.search.loading = true;
+            AppState.search.error = null;
+            UI.renderActiveItem(AppState.activeItem);
+
+            try {
+                const result = await DataAPI.searchAuctionHistory(AppState.search.filters);
+                AppState.search.rows = result.rows || [];
+                AppState.search.total = Number(result.total || 0);
+                AppState.search.lastRunAt = Date.now();
+            } catch (err) {
+                AppState.search.rows = [];
+                AppState.search.total = 0;
+                AppState.search.error = err?.message || 'Search failed';
+            } finally {
+                AppState.search.loading = false;
+                UI.renderActiveItem(AppState.activeItem);
+            }
         },
 
         async selectAndPriceItem(index, forceRefresh = false) {
