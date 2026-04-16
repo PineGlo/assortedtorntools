@@ -1877,7 +1877,7 @@ ensurePill(item, index) {
             if (src === 'market') return 'Market';
             if (filters?.includeBazaar && !filters?.includeMarket) return 'Bazaar';
             if (!filters?.includeBazaar && filters?.includeMarket) return 'Market';
-            return 'Unknown source';
+            return 'Historical listing';
         },
 
         getSearchRowBonusesLabel(row, filters = null) {
