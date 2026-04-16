@@ -870,8 +870,12 @@
         }
     }
 
-    async function requestDeposit(source = 'manual') {
-        if (isPaused()) return;
+    async function requestDeposit(source = 'manual', opts = {}) {
+        const forceWhenPaused = !!opts.forceWhenPaused;
+        if (isPaused()) {
+            if (!forceWhenPaused) return;
+            setPausedState(false);
+        }
 
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
@@ -1302,7 +1306,7 @@
             fontWeight: '700',
             cursor: 'pointer'
         });
-        depositBtn.onclick = () => requestDeposit('manual');
+        depositBtn.onclick = () => requestDeposit('manual', { forceWhenPaused: true });
 
         const autoToggle = document.createElement('button');
         const cashToggle = document.createElement('button');
@@ -1406,7 +1410,7 @@
             if (!amLeader()) {
                 maybeClaimLeadership(true);
             }
-            await requestDeposit('manual:test-trigger');
+            await requestDeposit('manual:test-trigger', { forceWhenPaused: true });
         };
 
         testFactionBtn.textContent = 'Test Faction Fallback';
@@ -1414,6 +1418,9 @@
         testFactionBtn.onclick = async () => {
             if (!amLeader()) {
                 maybeClaimLeadership(true);
+            }
+            if (isPaused()) {
+                setPausedState(false);
             }
             const payload = buildDepositRequest('manual:faction-test');
             payload.target = 'faction';
