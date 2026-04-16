@@ -1197,6 +1197,54 @@
     });
   }
 
+  function requestOwnFactionProfileApi() {
+    return new Promise((resolve) => {
+      const latest = loadSettings();
+      const key = String(latest.tornApiKey || state.cfg.tornApiKey || "").trim();
+      if (!key) {
+        resolve({ ok: false, error: "Missing Torn API key in Torn Core settings." });
+        return;
+      }
+
+      const allowance = reserveTornApiCall();
+      if (!allowance.ok) {
+        resolve({ ok: false, error: allowance.error, errorCode: "hard_limit" });
+        return;
+      }
+
+      const url = `https://api.torn.com/user/?selections=profile&key=${encodeURIComponent(key)}&comment=torn_core_faction_detect`;
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        onload: (response) => {
+          try {
+            const data = JSON.parse(response.responseText || "{}");
+            if (data?.error) {
+              resolve({
+                ok: false,
+                error: data.error.error || "Own profile API error",
+                errorCode: Number(data.error.code) || null,
+              });
+              return;
+            }
+
+            const factionId = Number(data?.faction?.faction_id || data?.faction_id || 0);
+            const factionName = normalizeText(data?.faction?.faction_name || data?.faction_name || "");
+            if (!Number.isFinite(factionId) || factionId <= 0) {
+              resolve({ ok: false, error: "Could not detect your faction ID from Torn profile API." });
+              return;
+            }
+            resolve({ ok: true, factionId, factionName });
+          } catch {
+            resolve({ ok: false, error: "Own profile parse error" });
+          }
+        },
+        onerror: () => resolve({ ok: false, error: "Own profile network error" }),
+        ontimeout: () => resolve({ ok: false, error: "Own profile timeout" }),
+      });
+    });
+  }
+
   function openIndexedDb(dbName) {
     return new Promise((resolve, reject) => {
       try {
@@ -1580,11 +1628,20 @@
 
     const refreshMs = Math.max(5000, Number(state.cfg.factionHospitalRefreshMs) || 30000);
     const detectedFactionId = detectFactionIdFromDom();
-    const factionId = Number(state.cfg.factionHospitalFactionId) || detectedFactionId || Number(state.core.factionHospital.factionId) || 0;
+    let factionId = Number(state.cfg.factionHospitalFactionId) || detectedFactionId || Number(state.core.factionHospital.factionId) || 0;
+    let detectedByApiName = "";
     if (!Number.isFinite(factionId) || factionId <= 0) {
-      state.core.factionHospital.lastError = "No faction ID set/detected for faction hospital batching.";
-      publishCore(true);
-      return { ok: false, source: "policy", error: state.core.factionHospital.lastError };
+      const selfProfile = await requestOwnFactionProfileApi();
+      if (selfProfile.ok && Number.isFinite(Number(selfProfile.factionId)) && Number(selfProfile.factionId) > 0) {
+        factionId = Number(selfProfile.factionId);
+        detectedByApiName = String(selfProfile.factionName || "");
+        state.cfg.factionHospitalFactionId = factionId;
+        saveSettings();
+      } else {
+        state.core.factionHospital.lastError = selfProfile.error || "No faction ID set/detected for faction hospital batching.";
+        publishCore(true);
+        return { ok: false, source: "policy", error: state.core.factionHospital.lastError };
+      }
     }
 
     if (!force && state.core.factionHospital.lastRefreshAt && (now() - Number(state.core.factionHospital.lastRefreshAt)) < refreshMs) {
@@ -1641,7 +1698,7 @@
     if (detectedFactionId && !Number(state.cfg.factionHospitalFactionId)) {
       state.cfg.factionHospitalFactionId = detectedFactionId;
     }
-    if (factionName) state.core.factionHospital.factionName = factionName;
+    if (factionName || detectedByApiName) state.core.factionHospital.factionName = factionName || detectedByApiName;
     state.core.factionHospital.members = memberCount;
     state.core.factionHospital.lastRefreshAt = now();
     state.core.factionHospital.lastError = "";
