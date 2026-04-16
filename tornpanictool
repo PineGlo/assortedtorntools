@@ -234,11 +234,27 @@
         return localStorage.getItem(KEYS.leaderLockedTab) || '';
     }
 
+    function pruneStaleLockedLeader() {
+        const lockedTabId = getLockedLeaderTabId();
+        if (!lockedTabId || lockedTabId === TAB_ID) return;
+
+        const leader = readLeaderState();
+        const lockLooksStale =
+            !leader ||
+            leader.tabId !== lockedTabId ||
+            isLeaderStale(leader);
+
+        if (lockLooksStale) {
+            localStorage.removeItem(KEYS.leaderLockedTab);
+        }
+    }
+
     function isThisTabLockedLeader() {
         return getLockedLeaderTabId() === TAB_ID;
     }
 
     function canThisTabRunLeaderFlow() {
+        pruneStaleLockedLeader();
         if (!isLeaderModeEnabled()) return false;
         const lockedTabId = getLockedLeaderTabId();
         if (lockedTabId && lockedTabId !== TAB_ID) return false;
@@ -845,6 +861,10 @@
 
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
+
+        if (!amLeader()) {
+            maybeClaimLeadership(true);
+        }
 
         if (amLeader()) {
             await sleep(rand());
