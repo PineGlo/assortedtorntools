@@ -944,13 +944,20 @@
     ensureCoreShape();
     state.core.api.status.tornApiKeyConfigured = !!String(state.cfg.tornApiKey || "").trim();
     state.core.api.status.ffApiKeyConfigured = !!String(state.cfg.ffApiKey || "").trim();
+    if (state.core.api.status.ffApiKeyConfigured && String(state.core.api.status.ffLastError || "").includes("Missing FF Scouter API key")) {
+      state.core.api.status.ffLastError = "";
+    }
+    if (state.core.api.status.tornApiKeyConfigured && String(state.core.api.status.tornLastError || "").includes("Missing Torn API key")) {
+      state.core.api.status.tornLastError = "";
+    }
     syncTornRateStatus();
     state.core.api.status.updatedAt = now();
   }
 
   function requestTornProfileApi(userId, forceFresh = false) {
     return new Promise((resolve) => {
-      const key = String(state.cfg.tornApiKey || "").trim();
+      const latest = loadSettings();
+      const key = String(latest.tornApiKey || state.cfg.tornApiKey || "").trim();
       if (!key) {
         resolve({ ok: false, userId, error: "Missing Torn API key in Torn Core settings." });
         return;
@@ -1019,7 +1026,8 @@
 
   function requestFFBatchApi(userIds, forceFresh = false) {
     return new Promise((resolve) => {
-      const key = String(state.cfg.ffApiKey || "").trim();
+      const latest = loadSettings();
+      const key = String(latest.ffApiKey || state.cfg.ffApiKey || "").trim();
       if (!key) {
         resolve({ ok: false, error: "Missing FF Scouter API key in Torn Core settings.", rows: [] });
         return;
@@ -1031,7 +1039,7 @@
         return;
       }
 
-      const maxBatch = clamp(Number(state.cfg.ffMaxBatchSize) || 50, 1, 100);
+      const maxBatch = clamp(Number(latest.ffMaxBatchSize || state.cfg.ffMaxBatchSize) || 50, 1, 100);
       const ids = uniqueIds.slice(0, maxBatch);
       let url = `https://ffscouter.com/api/v1/get-stats?key=${encodeURIComponent(key)}&targets=${ids.join(",")}`;
       if (forceFresh) url += `&timestamp=${Date.now()}`;
@@ -1104,7 +1112,8 @@
 
   function requestFactionMembersApi(factionId) {
     return new Promise((resolve) => {
-      const key = String(state.cfg.tornApiKey || "").trim();
+      const latest = loadSettings();
+      const key = String(latest.tornApiKey || state.cfg.tornApiKey || "").trim();
       if (!key) {
         resolve({ ok: false, factionId, error: "Missing Torn API key in Torn Core settings." });
         return;
