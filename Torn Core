@@ -249,11 +249,11 @@
 
   function syncSettingsFromStorage() {
     const latest = loadSettings();
-    const currentTs = Number(state.cfg?.settingsUpdatedAt || 0);
-    const latestTs = Number(latest?.settingsUpdatedAt || 0);
+    if (isPanelEditableElement(document.activeElement)) return;
 
-    if (latestTs <= 0) return;
-    if (latestTs <= currentTs) return;
+    const currentJson = JSON.stringify(state.cfg || {});
+    const latestJson = JSON.stringify(latest || {});
+    if (currentJson === latestJson) return;
 
     state.cfg = { ...latest };
   }
