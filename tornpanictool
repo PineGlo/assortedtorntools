@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Vault Panic Deposit (Simple Leader + Fixed Vault Navigation)
 // @namespace    pineglow.torn.vaultpanic
-// @version      5.0
+// @version      5.1
 // @description  Auto deposits cash when life drops or cash spikes, with simple leader lock, fixed vault navigation, cash toggle, settings panel, and better reliability
 // @match        https://www.torn.com/*
 // @grant        none
@@ -191,15 +191,11 @@
 
     function readCoreState() {
         try {
-            if (window.TornCore?.getState) {
-                return window.TornCore.getState();
-            }
+            if (window.TornCore?.getState) return window.TornCore.getState();
         } catch {}
 
         try {
-            if (window.__TORN_CORE_STATE__) {
-                return window.__TORN_CORE_STATE__;
-            }
+            if (window.__TORN_CORE_STATE__) return window.__TORN_CORE_STATE__;
         } catch {}
 
         return null;
@@ -234,11 +230,24 @@
         return localStorage.getItem(KEYS.leaderLockedTab) || '';
     }
 
+    function pruneStaleLockedLeader() {
+        const lockedTabId = getLockedLeaderTabId();
+        if (!lockedTabId || lockedTabId === TAB_ID) return;
+
+        const leader = readLeaderState();
+        const lockLooksStale = !leader || leader.tabId !== lockedTabId || isLeaderStale(leader);
+
+        if (lockLooksStale) {
+            localStorage.removeItem(KEYS.leaderLockedTab);
+        }
+    }
+
     function isThisTabLockedLeader() {
         return getLockedLeaderTabId() === TAB_ID;
     }
 
     function canThisTabRunLeaderFlow() {
+        pruneStaleLockedLeader();
         if (!isLeaderModeEnabled()) return false;
         const lockedTabId = getLockedLeaderTabId();
         if (lockedTabId && lockedTabId !== TAB_ID) return false;
@@ -376,9 +385,7 @@
     function getCash() {
         const coreDom = getCoreDomState();
         const coreCash = coreDom?.cash?.onHand;
-        if (Number.isFinite(coreCash) && coreCash >= 0) {
-            return coreCash;
-        }
+        if (Number.isFinite(coreCash) && coreCash >= 0) return coreCash;
 
         const settings = getSettings();
 
@@ -420,9 +427,7 @@
     function getLife() {
         const coreDom = getCoreDomState();
         const coreLife = coreDom?.life?.current;
-        if (Number.isFinite(coreLife) && coreLife >= 0) {
-            return coreLife;
-        }
+        if (Number.isFinite(coreLife) && coreLife >= 0) return coreLife;
 
         const el =
             document.querySelector('a[class*="life"] p[class*="bar-value"]') ||
@@ -470,34 +475,25 @@
         return !!leader && leader.tabId === TAB_ID && !isLeaderStale(leader);
     }
 
-    function shouldTakeLeadership(currentLeader) {
-        if (!canThisTabRunLeaderFlow()) return false;
-
-        const mine = getMyLeaderPayload();
-
-        if (!currentLeader) return true;
-        if (isLeaderStale(currentLeader)) return true;
-        if (currentLeader.tabId === TAB_ID) return true;
-
-        if (mine.isVault && !currentLeader.isVault) return true;
-
-        return false;
+    function hasActiveLeader() {
+        const leader = readLeaderState();
+        return !!leader && !isLeaderStale(leader);
     }
 
     function maybeClaimLeadership(force = false) {
-        if (!force && !canThisTabRunLeaderFlow()) {
+        if (!force) {
             updateUIStatus();
             return false;
         }
 
-        const currentLeader = readLeaderState();
-        if ((force && canThisTabRunLeaderFlow()) || shouldTakeLeadership(currentLeader)) {
-            writeLeaderState(getMyLeaderPayload());
+        if (!canThisTabRunLeaderFlow()) {
             updateUIStatus();
-            return true;
+            return false;
         }
+
+        writeLeaderState(getMyLeaderPayload());
         updateUIStatus();
-        return false;
+        return true;
     }
 
     function heartbeatLeadership() {
@@ -507,11 +503,7 @@
             return;
         }
 
-        if (amLeader()) {
-            writeLeaderState(getMyLeaderPayload());
-        } else {
-            maybeClaimLeadership(false);
-        }
+        if (amLeader()) writeLeaderState(getMyLeaderPayload());
         updateUIStatus();
     }
 
@@ -525,6 +517,18 @@
                 } catch {}
             }
         }
+    }
+
+    function forceResetAllLeaderState(claimAfter = true) {
+        localStorage.removeItem(KEYS.leaderState);
+        localStorage.removeItem(KEYS.leaderLockedTab);
+        if (bc) {
+            try {
+                bc.postMessage({ type: 'leader-released', tabId: TAB_ID, forced: true });
+            } catch {}
+        }
+        if (claimAfter) maybeClaimLeadership(true);
+        updateUIStatus();
     }
 
     function buildDepositRequest(source = 'manual') {
@@ -559,70 +563,133 @@
         }
     }
 
+    function findActionControl(root, matcher) {
+        if (!root) return null;
+        const controls = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"], a'));
+        return controls.find(ctrl => {
+            const txt = ((ctrl.textContent || '') + ' ' + (ctrl.value || '')).replace(/\s+/g, ' ').trim();
+            return matcher.test(txt);
+        }) || null;
+    }
+
     function getDepositForm() {
-        return document.querySelector('form.vault-cont.right.deposit-box');
-    }
-
-    function getMaxBtn() {
-        const form = getDepositForm();
-        return form?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
-    }
-
-    function getDepositBtn() {
-        const form = getDepositForm();
-        return Array.from(form?.querySelectorAll('input.torn-btn[type="submit"]') || [])
-            .find(btn => (btn.value || '').trim().toUpperCase() === 'DEPOSIT') || null;
+        return document.querySelector('form.vault-cont.right.deposit-box')
+            || document.querySelector('form[class*="deposit"]')
+            || document.querySelector('.vault-cont.right.deposit-box')
+            || document.querySelector('[class*="deposit-box"]')
+            || Array.from(document.querySelectorAll('form, div')).find(el => {
+                const txt = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                return txt.includes('you have $') && txt.includes('deposit');
+            })
+            || null;
     }
 
     function getDepositAmountInput() {
         const form = getDepositForm();
         if (!form) return null;
 
-        return form.querySelector('input[name="money"], input[name="amount"], input[type="text"], input[type="number"]') || null;
+        return form.querySelector('input[name="money"], input[name="amount"], input[class*="input-money"], input[type="text"], input[type="number"]')
+            || Array.from(form.querySelectorAll('input')).find(input => {
+                const type = (input.type || '').toLowerCase();
+                return type === 'text' || type === 'number' || !type;
+            })
+            || null;
+    }
+
+    function getMaxBtn() {
+        const form = getDepositForm();
+        if (!form) return null;
+
+        return findActionControl(form, /^(max|all)$/i)
+            || Array.from(form.querySelectorAll('input[type="button"], button, a')).find(el => {
+                const txt = ((el.textContent || '') + ' ' + (el.value || '')).replace(/\s+/g, ' ').trim().toLowerCase();
+                return txt === 'max' || txt === 'all';
+            })
+            || null;
+    }
+
+    function getDepositBtn() {
+        const form = getDepositForm();
+        if (!form) return null;
+
+        return findActionControl(form, /^deposit$/i)
+            || Array.from(form.querySelectorAll('input[type="submit"], input[type="button"], button, a')).find(el => {
+                const txt = ((el.textContent || '') + ' ' + (el.value || '')).replace(/\s+/g, ' ').trim().toLowerCase();
+                return txt === 'deposit' || txt === 'deposit money';
+            })
+            || null;
     }
 
     function getFactionMoneyGroup() {
-        return document.querySelector('div.input-money-group');
+        return document.querySelector('div.input-money-group')
+            || Array.from(document.querySelectorAll('div, form')).find(el => {
+                const txt = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                return txt.includes('deposit money') || txt.includes('deposit');
+            })
+            || null;
     }
 
     function getFactionMaxBtn() {
         const group = getFactionMoneyGroup();
-        return group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+        return findActionControl(group, /^(max|all)$/i)
+            || group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]')
+            || Array.from(group?.querySelectorAll('button, input[type="button"], a') || []).find(el => {
+                const txt = ((el.textContent || '') + ' ' + (el.value || '')).replace(/\s+/g, ' ').trim().toLowerCase();
+                return txt === 'max' || txt === 'all';
+            })
+            || null;
     }
 
     function getFactionAmountInput() {
         const group = getFactionMoneyGroup();
         if (!group) return null;
-        return group.querySelector('input.amount.input-money[type="text"], input.amount.input-money') || null;
+
+        return group.querySelector('input.amount.input-money[type="text"], input.amount.input-money, input[type="text"], input[type="number"]')
+            || Array.from(group.querySelectorAll('input')).find(input => {
+                const type = (input.type || '').toLowerCase();
+                return type === 'text' || type === 'number' || !type;
+            })
+            || null;
     }
 
     function getFactionDepositBtn() {
-        return Array.from(document.querySelectorAll('button.torn-btn'))
-            .find(btn => (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'DEPOSIT MONEY') || null;
+        return findActionControl(document, /deposit money|deposit/i)
+            || Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a'))
+                .find(btn => {
+                    const txt = ((btn.textContent || '') + ' ' + (btn.value || '')).replace(/\s+/g, ' ').trim().toUpperCase();
+                    return txt === 'DEPOSIT MONEY' || txt === 'DEPOSIT';
+                })
+            || null;
     }
 
     function getFactionConfirmYesBtn() {
-        return Array.from(document.querySelectorAll('a.yes'))
-            .find(el => (el.textContent || '').trim().toUpperCase() === 'YES') || null;
+        return Array.from(document.querySelectorAll('a, button, input[type="button"], input[type="submit"]'))
+            .find(el => {
+                const txt = ((el.textContent || '') + ' ' + (el.value || '')).trim().toUpperCase();
+                return txt === 'YES';
+            }) || null;
     }
 
     function goToVaultPage() {
+        const target = VAULT_URL;
+
         if (isVaultPage()) return true;
 
         if (location.pathname.includes('/properties.php')) {
-            if (location.hash !== VAULT_HASH) {
-                location.hash = VAULT_HASH;
-            }
+            if (location.href !== target) location.href = target;
             return false;
         }
 
-        location.assign(VAULT_URL);
+        location.href = target;
         return false;
     }
 
     function goToFactionArmoryPage() {
+        const target = FACTION_ARMORY_URL;
+
         if (isFactionArmoryPage()) return true;
-        location.assign(FACTION_ARMORY_URL);
+
+        location.href = target;
         return false;
     }
 
@@ -631,10 +698,10 @@
             const start = Date.now();
 
             const timer = setInterval(() => {
-                const maxBtn = getMaxBtn();
+                const input = getDepositAmountInput();
                 const depositBtn = getDepositBtn();
 
-                if (maxBtn && depositBtn) {
+                if (input && depositBtn) {
                     clearInterval(timer);
                     resolve(true);
                     return;
@@ -653,10 +720,10 @@
             const start = Date.now();
 
             const timer = setInterval(() => {
-                const maxBtn = getFactionMaxBtn();
+                const input = getFactionAmountInput();
                 const depositBtn = getFactionDepositBtn();
 
-                if (maxBtn && depositBtn) {
+                if (input && depositBtn) {
                     clearInterval(timer);
                     resolve(true);
                     return;
@@ -691,16 +758,14 @@
                     return;
                 }
 
-                if (Date.now() - started >= 450) {
+                if (Date.now() - started >= 600) {
                     clearInterval(timer);
                     resolve(false);
                 }
             }, 20);
         });
 
-        if (!maxApplied) {
-            await sleep(20);
-        }
+        if (!maxApplied) await sleep(25);
 
         const input = inputGetter();
         const amount = parseMoneyText(input?.value || '');
@@ -708,37 +773,75 @@
     }
 
     async function doDeposit() {
+        const input = getDepositAmountInput();
+        let depositBtn = getDepositBtn();
+
+        if (!input || !depositBtn) return false;
+
+        let amount = 0;
         const maxBtn = getMaxBtn();
-        const depositBtn = getDepositBtn();
 
-        if (!maxBtn || !depositBtn) return false;
+        if (maxBtn) {
+            amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+        }
 
-        const amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+        if (!Number.isFinite(amount) || amount <= 0) {
+            const cash = getCash();
+            if (Number.isFinite(cash) && cash > 0) {
+                input.focus();
+                input.value = String(cash);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                await sleep(50);
+                amount = cash;
+            }
+        }
+
         if (!Number.isFinite(amount) || amount <= 0) return false;
 
-        const freshDepositBtn = getDepositBtn();
-        if (!freshDepositBtn) return false;
-        if (freshDepositBtn.disabled || freshDepositBtn.classList.contains('disabled')) return false;
+        depositBtn = getDepositBtn();
+        if (!depositBtn) return false;
+        if (depositBtn.disabled || depositBtn.classList.contains('disabled')) return false;
 
-        tap(freshDepositBtn);
+        tap(depositBtn);
         return true;
     }
 
     async function doFactionDeposit() {
-        const maxBtn = getFactionMaxBtn();
-        const depositBtn = getFactionDepositBtn();
-        if (!maxBtn || !depositBtn) return false;
+        const input = getFactionAmountInput();
+        let depositBtn = getFactionDepositBtn();
+        if (!input || !depositBtn) return false;
 
-        const amount = await readAmountAfterMax(maxBtn, getFactionAmountInput);
+        let amount = 0;
+        const maxBtn = getFactionMaxBtn();
+
+        if (maxBtn) {
+            amount = await readAmountAfterMax(maxBtn, getFactionAmountInput);
+        }
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+            const cash = getCash();
+            if (Number.isFinite(cash) && cash > 0) {
+                input.focus();
+                input.value = String(cash);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                await sleep(50);
+                amount = cash;
+            }
+        }
+
         if (!Number.isFinite(amount) || amount <= 0) return false;
+
+        depositBtn = getFactionDepositBtn();
+        if (!depositBtn) return false;
 
         tap(depositBtn);
         await sleep(rand(60, 120));
 
         const yesBtn = getFactionConfirmYesBtn();
-        if (yesBtn) {
-            tap(yesBtn);
-        }
+        if (yesBtn) tap(yesBtn);
+
         return true;
     }
 
@@ -750,10 +853,6 @@
         const request = getDepositRequest();
         if (!request) return;
 
-        if (lastHandledRequestId === request.requestId && isVaultPage() === false) {
-            // keep allowing retries after navigation, do not early exit
-        }
-
         depositing = true;
         updateUIStatus();
 
@@ -762,9 +861,7 @@
 
             if (isHospitalAreaUnavailable() && request.target !== 'faction') {
                 setDepositRequest({ ...request, target: 'faction' });
-                if (!isFactionArmoryPage()) {
-                    goToFactionArmoryPage();
-                }
+                if (!isFactionArmoryPage()) goToFactionArmoryPage();
                 return;
             }
 
@@ -798,8 +895,18 @@
             if (!Number.isFinite(vaultTotal)) return;
 
             const room = Math.max(0, VAULT_CAP - vaultTotal);
+
+            let amount = 0;
             const maxBtn = getMaxBtn();
-            const amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+            if (maxBtn) {
+                amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+            }
+
+            if ((!Number.isFinite(amount) || amount <= 0)) {
+                const cash = getCash();
+                if (Number.isFinite(cash) && cash > 0) amount = cash;
+            }
+
             if (!Number.isFinite(amount) || amount <= 0) return;
 
             if (amount > room) {
@@ -820,11 +927,19 @@
         }
     }
 
-    async function requestDeposit(source = 'manual') {
-        if (isPaused()) return;
+    async function requestDeposit(source = 'manual', opts = {}) {
+        const forceWhenPaused = !!opts.forceWhenPaused;
+        if (isPaused()) {
+            if (!forceWhenPaused) return;
+            setPausedState(false);
+        }
 
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
+
+        if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+            maybeClaimLeadership(true);
+        }
 
         if (amLeader()) {
             await sleep(rand());
@@ -836,6 +951,9 @@
         const settings = getSettings();
 
         if (isPaused()) return;
+        if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+            maybeClaimLeadership(true);
+        }
         if (!amLeader()) return;
         if (!isAutoModeEnabled()) return;
 
@@ -873,7 +991,6 @@
             const iAmLeader = amLeader();
             const leaderEnabled = canThisTabRunLeaderFlow();
             const coreOnline = isCoreConnected();
-
             const role = mine.isVault ? 'Vault Tab' : (mine.isVisible ? 'Active Tab' : 'Background Tab');
 
             if (!leaderEnabled) {
@@ -907,7 +1024,7 @@
                 uiFlowEl.textContent = `Flow: PAUSED`;
                 uiFlowEl.style.color = '#FF8EA1';
             } else if (depositing) {
-                uiFlowEl.textContent = `Flow: DEPOSITING${isVaultPage() ? ' | vault ready' : ' | navigating'}`;
+                uiFlowEl.textContent = `Flow: DEPOSITING${isVaultPage() ? ' | vault ready' : isFactionArmoryPage() ? ' | faction ready' : ' | navigating'}`;
                 uiFlowEl.style.color = '#7CFF9E';
             } else if (request) {
                 if (request.target === 'faction') {
@@ -1023,9 +1140,7 @@
             panel.style.opacity = '1';
             if (fadeTimer) clearTimeout(fadeTimer);
             fadeTimer = setTimeout(() => {
-                if (!panel.matches(':hover')) {
-                    panel.style.opacity = '0.38';
-                }
+                if (!panel.matches(':hover')) panel.style.opacity = '0.38';
             }, 2200);
         }
 
@@ -1156,21 +1271,10 @@
     function createUI() {
         if (document.getElementById('panic-panel')) return;
 
-        if (localStorage.getItem(KEYS.cashMode) === null) {
-            localStorage.setItem(KEYS.cashMode, '0');
-        }
-
-        if (localStorage.getItem(KEYS.autoMode) === null) {
-            localStorage.setItem(KEYS.autoMode, '0');
-        }
-
-        if (localStorage.getItem(KEYS.pauseMode) === null) {
-            localStorage.setItem(KEYS.pauseMode, '0');
-        }
-
-        if (localStorage.getItem(KEYS.leaderMode) === null) {
-            localStorage.setItem(KEYS.leaderMode, '1');
-        }
+        if (localStorage.getItem(KEYS.cashMode) === null) localStorage.setItem(KEYS.cashMode, '0');
+        if (localStorage.getItem(KEYS.autoMode) === null) localStorage.setItem(KEYS.autoMode, '0');
+        if (localStorage.getItem(KEYS.pauseMode) === null) localStorage.setItem(KEYS.pauseMode, '0');
+        if (localStorage.getItem(KEYS.leaderMode) === null) localStorage.setItem(KEYS.leaderMode, '1');
 
         const panel = document.createElement('div');
         panel.id = 'panic-panel';
@@ -1248,19 +1352,20 @@
             fontWeight: '700',
             cursor: 'pointer'
         });
-        depositBtn.onclick = () => requestDeposit('manual');
+        depositBtn.onclick = () => requestDeposit('manual', { forceWhenPaused: true });
 
         const autoToggle = document.createElement('button');
         const cashToggle = document.createElement('button');
         const pauseToggle = document.createElement('button');
         const testBtn = document.createElement('button');
         const testFactionBtn = document.createElement('button');
+        const fixLeaderBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
         const leaderWrap = document.createElement('label');
         const leaderCheckbox = document.createElement('input');
         const leaderText = document.createElement('span');
 
-        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, settingsToggle].forEach(btn => {
+        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, fixLeaderBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
                 padding: '8px 10px',
                 color: '#fff',
@@ -1348,23 +1453,24 @@
         testBtn.textContent = 'Test Trigger';
         testBtn.style.background = '#2a2a2a';
         testBtn.onclick = async () => {
-            if (!amLeader()) {
-                maybeClaimLeadership(true);
-            }
-            await maybeAutoDeposit('test', 999);
+            await requestDeposit('manual:test-trigger', { forceWhenPaused: true });
         };
 
         testFactionBtn.textContent = 'Test Faction Fallback';
         testFactionBtn.style.background = '#2a2a2a';
         testFactionBtn.onclick = async () => {
-            if (!amLeader()) {
-                maybeClaimLeadership(true);
-            }
+            if (isPaused()) setPausedState(false);
             const payload = buildDepositRequest('manual:faction-test');
             payload.target = 'faction';
             setDepositRequest(payload);
             await sleep(rand());
             processDepositFlow();
+        };
+
+        fixLeaderBtn.textContent = 'Fix Leader (Reset)';
+        fixLeaderBtn.style.background = '#5C1F2A';
+        fixLeaderBtn.onclick = () => {
+            forceResetAllLeaderState(true);
         };
 
         settingsToggle.onclick = () => {
@@ -1477,6 +1583,7 @@
         body.appendChild(pauseToggle);
         body.appendChild(testBtn);
         body.appendChild(testFactionBtn);
+        body.appendChild(fixLeaderBtn);
         body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
         body.appendChild(uiCashEl);
@@ -1569,13 +1676,9 @@
         if (!dom) return false;
 
         const domVersion = Number(dom.domVersion);
-        if (Number.isFinite(domVersion) && domVersion === lastCoreDomVersion) {
-            return false;
-        }
+        if (Number.isFinite(domVersion) && domVersion === lastCoreDomVersion) return false;
 
-        if (Number.isFinite(domVersion)) {
-            lastCoreDomVersion = domVersion;
-        }
+        if (Number.isFinite(domVersion)) lastCoreDomVersion = domVersion;
 
         evaluateLifeTrigger(dom.life?.current);
         evaluateCashTrigger(dom.cash?.onHand);
@@ -1604,7 +1707,6 @@
             const consumed = consumeCoreSnapshot();
             if (consumed) return;
 
-            // Fallback for when Torn Core is not running yet.
             evaluateLifeTrigger(getLife());
             evaluateCashTrigger(getCash());
             updateUIStatus();
@@ -1620,31 +1722,28 @@
         if (leaderWatcherStarted) return;
         leaderWatcherStarted = true;
 
-        maybeClaimLeadership(true);
-
         setInterval(() => {
             heartbeatLeadership();
         }, getSettings().leaderHeartbeatMs);
 
         document.addEventListener('visibilitychange', () => {
-            maybeClaimLeadership(false);
             updateUIStatus();
         });
 
         window.addEventListener('focus', () => {
-            maybeClaimLeadership(false);
             updateUIStatus();
         });
 
         window.addEventListener('hashchange', () => {
             setTimeout(() => {
-                maybeClaimLeadership(false);
                 processDepositFlow();
                 updateUIStatus();
             }, 100);
         });
 
         window.addEventListener('beforeunload', () => {
+            const request = getDepositRequest();
+            if (request) return;
             releaseLeadershipIfOwned();
         });
 
@@ -1662,20 +1761,15 @@
                     releaseLeadershipIfOwned();
                 }
 
-                if (uiLeaderCheckbox) {
-                    uiLeaderCheckbox.checked = isThisTabLockedLeader();
-                }
+                if (uiLeaderCheckbox) uiLeaderCheckbox.checked = isThisTabLockedLeader();
                 refreshPauseToggleButton();
-
                 updateUIStatus();
 
                 if (e.key === KEYS.leaderDepositRequest && amLeader()) {
                     setTimeout(() => processDepositFlow(), rand(20, 60));
                 }
 
-                if (settingsInputs.delayMin) {
-                    loadSettingsIntoInputs();
-                }
+                if (settingsInputs.delayMin) loadSettingsIntoInputs();
             }
         });
 
@@ -1688,11 +1782,7 @@
                     setTimeout(() => processDepositFlow(), rand(20, 60));
                 }
 
-                if (msg.type === 'leader-released') {
-                    maybeClaimLeadership(false);
-                }
-
-                if (msg.type === 'leader-heartbeat') {
+                if (msg.type === 'leader-released' || msg.type === 'leader-heartbeat') {
                     updateUIStatus();
                 }
             };
@@ -1704,6 +1794,9 @@
         flowWatcherStarted = true;
 
         setInterval(() => {
+            if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+                maybeClaimLeadership(true);
+            }
             if (!amLeader()) return;
             processDepositFlow();
         }, 1000);
@@ -1731,6 +1824,21 @@
         });
     }
 
+    function resumePendingFlowSoon() {
+        setTimeout(() => {
+            if (!canThisTabRunLeaderFlow()) return;
+
+            const request = getDepositRequest();
+            if (!request) return;
+
+            if (!amLeader()) maybeClaimLeadership(true);
+
+            setTimeout(() => {
+                if (amLeader()) processDepositFlow();
+            }, 150);
+        }, 250);
+    }
+
     function init() {
         createUI();
         watchLeadership();
@@ -1739,6 +1847,18 @@
         watchFlow();
         watchPauseHotkey();
         updateUIStatus();
+
+        resumePendingFlowSoon();
+
+        window.addEventListener('pageshow', () => {
+            resumePendingFlowSoon();
+        });
+
+        document.addEventListener('readystatechange', () => {
+            if (document.readyState === 'interactive' || document.readyState === 'complete') {
+                resumePendingFlowSoon();
+            }
+        });
     }
 
     init();
