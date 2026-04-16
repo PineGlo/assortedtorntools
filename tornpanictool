@@ -486,34 +486,20 @@
         return !!leader && leader.tabId === TAB_ID && !isLeaderStale(leader);
     }
 
-    function shouldTakeLeadership(currentLeader) {
-        if (!canThisTabRunLeaderFlow()) return false;
-
-        const mine = getMyLeaderPayload();
-
-        if (!currentLeader) return true;
-        if (isLeaderStale(currentLeader)) return true;
-        if (currentLeader.tabId === TAB_ID) return true;
-
-        if (mine.isVault && !currentLeader.isVault) return true;
-
-        return false;
-    }
-
     function maybeClaimLeadership(force = false) {
-        if (!force && !canThisTabRunLeaderFlow()) {
+        if (!force) {
             updateUIStatus();
             return false;
         }
 
-        const currentLeader = readLeaderState();
-        if ((force && canThisTabRunLeaderFlow()) || shouldTakeLeadership(currentLeader)) {
-            writeLeaderState(getMyLeaderPayload());
+        if (!canThisTabRunLeaderFlow()) {
             updateUIStatus();
-            return true;
+            return false;
         }
+
+        writeLeaderState(getMyLeaderPayload());
         updateUIStatus();
-        return false;
+        return true;
     }
 
     function heartbeatLeadership() {
@@ -523,11 +509,7 @@
             return;
         }
 
-        if (amLeader()) {
-            writeLeaderState(getMyLeaderPayload());
-        } else {
-            maybeClaimLeadership(false);
-        }
+        if (amLeader()) writeLeaderState(getMyLeaderPayload());
         updateUIStatus();
     }
 
@@ -879,10 +861,6 @@
 
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
-
-        if (!amLeader()) {
-            maybeClaimLeadership(true);
-        }
 
         if (amLeader()) {
             await sleep(rand());
@@ -1407,18 +1385,12 @@
         testBtn.textContent = 'Test Trigger';
         testBtn.style.background = '#2a2a2a';
         testBtn.onclick = async () => {
-            if (!amLeader()) {
-                maybeClaimLeadership(true);
-            }
             await requestDeposit('manual:test-trigger', { forceWhenPaused: true });
         };
 
         testFactionBtn.textContent = 'Test Faction Fallback';
         testFactionBtn.style.background = '#2a2a2a';
         testFactionBtn.onclick = async () => {
-            if (!amLeader()) {
-                maybeClaimLeadership(true);
-            }
             if (isPaused()) {
                 setPausedState(false);
             }
@@ -1689,25 +1661,20 @@
         if (leaderWatcherStarted) return;
         leaderWatcherStarted = true;
 
-        maybeClaimLeadership(true);
-
         setInterval(() => {
             heartbeatLeadership();
         }, getSettings().leaderHeartbeatMs);
 
         document.addEventListener('visibilitychange', () => {
-            maybeClaimLeadership(false);
             updateUIStatus();
         });
 
         window.addEventListener('focus', () => {
-            maybeClaimLeadership(false);
             updateUIStatus();
         });
 
         window.addEventListener('hashchange', () => {
             setTimeout(() => {
-                maybeClaimLeadership(false);
                 processDepositFlow();
                 updateUIStatus();
             }, 100);
@@ -1758,7 +1725,7 @@
                 }
 
                 if (msg.type === 'leader-released') {
-                    maybeClaimLeadership(false);
+                    updateUIStatus();
                 }
 
                 if (msg.type === 'leader-heartbeat') {
